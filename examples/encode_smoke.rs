@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None // CUDA nimmt Device 0
     };
-    let hw_ctx = hw::HwContext::create(kind, dev_arg, width, height)?;
+    let hw_ctx = hw::HwContext::create(kind, dev_arg, width, height, AVPixelFormat::AV_PIX_FMT_NV12)?;
     eprintln!("[encode_smoke] HW-Context ({:?}) angelegt", kind);
 
     let cfg = EncoderConfig {

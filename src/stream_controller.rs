@@ -175,7 +175,13 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     } else {
         None
     };
-    let hw_ctx = hw::HwContext::create(kind, dev_arg, params.width, params.height)?;
+    let hw_ctx = hw::HwContext::create(
+        kind,
+        dev_arg,
+        params.width,
+        params.height,
+        ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+    )?;
 
     let cfg = EncoderConfig {
         vendor,

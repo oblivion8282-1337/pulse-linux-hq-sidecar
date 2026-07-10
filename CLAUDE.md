@@ -82,9 +82,18 @@ ab (dlopen libEGL, Device-Plattform), `pipewire_stream.rs` bietet sie als Choice
 re-announced endlos. Live verifiziert: BGRx 1920×1080, NVIDIA-Modifier
 `0x0300000000606010`, DMABUF-Frames fließen (`capture_smoke`).
 SPA_PARAM-ids: EnumFormat=3, Format=4, Buffers=5, Meta=6, Latency=15, Tag=17, Props=2.
-**Als Nächstes:** Zero-Copy-Import DMABUF→Encoder (NVENC: EGLImage/CUDA-Interop wegen
-Block-Linear-Modifier; VAAPI: `av_hwframe_map` DRM_PRIME), dann Audio (Opus, 2-Stream-
-FLV), `SyntheticSource` im StreamController ersetzen, `test_driver`-Example.
+**Zero-Copy-NVENC steht** (`src/encode/nv_import.rs` + `examples/capture_encode_smoke.rs`,
+live verifiziert: Portal→DMABUF→EGLImage→GL-Staging→CUDA→NVENC→mp4, Farben korrekt):
+DMABUF→`eglCreateImageKHR`→GL-Textur→`glCopyImageSubData` in eigene RGBA8-Staging-Textur
+(CUDA kann EGLImage-Texturen NICHT registrieren → INVALID_VALUE; GSR kopiert genauso)
+→`cuGraphicsGLRegisterImage` (einmalig auf Staging)→`cuMemcpy2D` ARRAY→DEVICE in
+ffmpeg-CUDA-Frame sw_format **BGR0** (NVENC nimmt RGB direkt). FFmpeg-CUDA-Device MUSS
+`AV_CUDA_USE_PRIMARY_CONTEXT` nutzen (hw.rs), sonst fremder CUcontext. Capture-Stop läuft
+über `pw::channel` → `mainloop.quit()` (mpsc weckt den Mainloop nicht → hing ewig).
+Compositor liefert Frames nur bei Damage (statischer Schirm = wenige Frames — kein Bug).
+**Als Nächstes:** VAAPI-Import (`av_hwframe_map` DRM_PRIME, per Analogie), Audio (Opus,
+2-Stream-FLV), `SyntheticSource` im StreamController ersetzen (+ PTS vom Capture-Clock,
+Frame-Duplikation bei fehlendem Damage für CFR), `test_driver`-Example.
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`

@@ -70,14 +70,33 @@ impl HwContext {
     ///
     /// `device_arg`: für VAAPI der Render-Node-Pfad (`/dev/dri/renderDXXX`);
     /// für CUDA `None` (FFmpeg nimmt CUDA-Device 0).
-    pub fn create(kind: HwDeviceKind, device_arg: Option<&str>, w: u32, h: u32) -> Result<Self> {
+    /// `sw_format`: Pixel-Format der Pool-Frames — NV12 für den Upload-Pfad
+    /// (synthetische Quelle), BGR0 für den DMABUF-Import (NVENC nimmt RGB
+    /// direkt und wandelt intern).
+    pub fn create(
+        kind: HwDeviceKind,
+        device_arg: Option<&str>,
+        w: u32,
+        h: u32,
+        sw_format: AVPixelFormat,
+    ) -> Result<Self> {
         let dev_c = device_arg.map(|s| std::ffi::CString::new(s).unwrap());
         let dev_ptr = dev_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null());
 
+        // hwcontext_cuda.h (nicht in den Bindings, Wert ist stabile Public-API):
+        // CUDA soll den Primary-Context des Devices nutzen statt einen eigenen
+        // zu erzeugen — nur so teilen sich FFmpeg und unser CUDA-GL-Interop
+        // (nv_import, ebenfalls Primary-Context) denselben CUcontext.
+        const AV_CUDA_USE_PRIMARY_CONTEXT: i32 = 1 << 0;
+        let flags = match kind {
+            HwDeviceKind::Cuda => AV_CUDA_USE_PRIMARY_CONTEXT,
+            HwDeviceKind::Vaapi => 0,
+        };
+
         let mut dev_ref: *mut AVBufferRef = ptr::null_mut();
-        let mut frames_ref: *mut AVBufferRef = ptr::null_mut();
+        let mut frames_ref: *mut AVBufferRef;
         unsafe {
-            let r = av_hwdevice_ctx_create(&mut dev_ref, kind.av_type(), dev_ptr, ptr::null_mut(), 0);
+            let r = av_hwdevice_ctx_create(&mut dev_ref, kind.av_type(), dev_ptr, ptr::null_mut(), flags);
             if r < 0 || dev_ref.is_null() {
                 return Err(anyhow!(
                     "av_hwdevice_ctx_create({:?}) failed (rc={r}) — Treiber/VAAPI/NVENC geladen?",
@@ -92,7 +111,7 @@ impl HwContext {
             }
             let fc = (*frames_ref).data as *mut AVHWFramesContext;
             (*fc).format = kind.pix_fmt();
-            (*fc).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            (*fc).sw_format = sw_format;
             (*fc).width = w as i32;
             (*fc).height = h as i32;
             // Kleiner Pool für Encode-Input; der Encoder puffert selbst.
@@ -120,13 +139,10 @@ impl HwContext {
         self.kind.ffmpeg_pixel()
     }
 
-    /// Lade einen CPU-Frame (sw_format=NV12) in den HW-Pool und gib das
-    /// `AVFrame` (Format CUDA/VAAPI) zurück. Caller besitzt das Frame und muss
-    /// es freigeben (`av_frame_free`).
-    ///
-    /// `sw` muss `format=NV12`, `width`/`height` passend haben.
-    pub fn upload_swframe(&self, sw: &ffmpeg::frame::Video, pts: i64) -> Result<*mut AVFrame> {
-        let sw_ptr = unsafe { sw.as_ptr() };
+    /// Hole ein leeres HW-Frame aus dem Pool (Format CUDA/VAAPI, Maße des
+    /// Pools, `hw_frames_ctx` gesetzt). Caller besitzt das Frame und muss es
+    /// freigeben (`av_frame_free`).
+    pub fn alloc_hwframe(&self) -> Result<*mut AVFrame> {
         unsafe {
             let mut hw = av_frame_alloc();
             if hw.is_null() {
@@ -135,7 +151,6 @@ impl HwContext {
             (*hw).format = self.kind.pix_fmt() as i32;
             (*hw).width = self.width;
             (*hw).height = self.height;
-            (*hw).pts = pts;
             // Encoder braucht den Frames-Ctx am Frame.
             let fc = av_buffer_ref(self.frames_ref);
             if fc.is_null() {
@@ -149,6 +164,20 @@ impl HwContext {
                 av_frame_free(&mut hw);
                 return Err(anyhow!("av_hwframe_get_buffer failed (rc={r})"));
             }
+            Ok(hw)
+        }
+    }
+
+    /// Lade einen CPU-Frame (sw_format des Pools) in den HW-Pool und gib das
+    /// `AVFrame` (Format CUDA/VAAPI) zurück. Caller besitzt das Frame und muss
+    /// es freigeben (`av_frame_free`).
+    ///
+    /// `sw` muss `format`/`width`/`height` passend zum Pool haben.
+    pub fn upload_swframe(&self, sw: &ffmpeg::frame::Video, pts: i64) -> Result<*mut AVFrame> {
+        let sw_ptr = unsafe { sw.as_ptr() };
+        unsafe {
+            let mut hw = self.alloc_hwframe()?;
+            (*hw).pts = pts;
             // CPU → GPU Kopie (NV12 sw → CUDA/VAAPI hw).
             let r = av_hwframe_transfer_data(hw, sw_ptr, 0);
             if r < 0 {

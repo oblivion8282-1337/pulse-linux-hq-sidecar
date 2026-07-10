@@ -11,6 +11,7 @@
 
 pub mod hw;
 pub mod mux_writer;
+pub mod nv_import;
 pub mod opts;
 
 use anyhow::{Context, Result, anyhow};

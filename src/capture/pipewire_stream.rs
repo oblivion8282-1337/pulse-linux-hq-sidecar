@@ -80,7 +80,9 @@ struct StreamData {
 
 /// PipeWire-Capture-Session. `stop` beendet den Worker-Thread.
 pub struct PipewireCapture {
-    stop_tx: Sender<()>,
+    /// pw::channel — weckt den Mainloop cross-thread (mpsc könnte das nicht:
+    /// `mainloop.run()` blockt und pollt keine fremden Channels).
+    stop_tx: pw::channel::Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -89,7 +91,7 @@ impl PipewireCapture {
     /// `node_id` vom Portal-`Start`.
     pub fn start(pw_fd: OwnedFd, node_id: u32, width: u32, height: u32) -> anyhow::Result<(Receiver<DmabufFrame>, Self)> {
         let (frame_tx, frame_rx) = channel::<DmabufFrame>();
-        let (stop_tx, stop_rx) = channel::<()>();
+        let (stop_tx, stop_rx) = pw::channel::channel::<()>();
 
         let worker = thread::Builder::new()
             .name("pipewire-capture".into())
@@ -101,12 +103,11 @@ impl PipewireCapture {
         Ok((frame_rx, Self { stop_tx, worker: Some(worker) }))
     }
 
-    /// Stoppe den Worker (signal + join). Schließt die PipeWire-Verbindung.
+    /// Stoppe den Worker (Mainloop-quit + join). Schließt die
+    /// PipeWire-Verbindung.
     pub fn stop(&mut self) {
         let _ = self.stop_tx.send(());
         if let Some(w) = self.worker.take() {
-            // Der Worker blockt im mainloop.run() — ein join könnte hängen, falls
-            // der Loop nicht auf stop reagiert. Wir geben ihm Frist.
             let _ = w.join();
         }
     }
@@ -238,11 +239,17 @@ fn run_pipewire(
     width: u32,
     height: u32,
     frame_tx: Sender<DmabufFrame>,
-    stop_rx: Receiver<()>,
+    stop_rx: pw::channel::Receiver<()>,
 ) -> anyhow::Result<()> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    // Stop-Signal (cross-thread) → Mainloop beenden. Der AttachedReceiver
+    // muss bis zum Loop-Ende leben.
+    let _stop_receiver = stop_rx.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_fd_rc(pw_fd, None)?;
 
@@ -466,6 +473,6 @@ fn run_pipewire(
 
     eprintln!("[pipewire] stream connected to node {node_id}, running mainloop …");
     mainloop.run();
-    let _ = stop_rx.try_recv();
+    eprintln!("[pipewire] mainloop beendet (stop)");
     Ok(())
 }
