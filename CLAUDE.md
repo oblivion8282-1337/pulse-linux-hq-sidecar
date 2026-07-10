@@ -73,15 +73,18 @@ API :9997, HLS :8888). Self-signed Cert: `openssl req -x509 -newkey rsa:2048 -no
 - libclang liegt als `/usr/lib/libclang.so` (kein pkg-config-File, aber bindgen findet es).
 - Ports: 1936 ist durch `passt` belegt → RTMPS läuft auf **11936**; WebRTC-ICE-UDP auf 18189.
 
-## Aktueller Blocker (Task 6)
-PipeWire-DMABUF-Consumer (`src/capture/pipewire_stream.rs`) steht, aber die SPA-Format-
-Verhandlung schlägt fehl: `"no more input formats"`. Portal (Mutter-ScreenCast) schickt
-`param_changed` nur für Props/Latency/Tag, nie ein fixiertes `Format`. Vermutung: Mutter
-liefert DMA-BUF **mit Modifier** — GSR bietet Modifier via `eglQueryDmaBufModifiersEXT`
-an (Choice-Enum von Longs an `SPA_FORMAT_VIDEO_modifier`); ohne das lehnt das Portal ab.
+## Task 6 — Stand
+Ex-Blocker **gelöst** (Commit `6277015`): Die SPA-Format-Verhandlung brauchte explizite
+DRM-Modifier. `src/capture/egl_modifiers.rs` fragt sie via `eglQueryDmaBufModifiersEXT`
+ab (dlopen libEGL, Device-Plattform), `pipewire_stream.rs` bietet sie als Choice-Enum
+(`MANDATORY|DONT_FIXATE`) an und macht den Fixierungs-Tanz aus der PipeWire-DMABUF-Doku.
+**Falle:** SPA stellt fixierte Werte als `Choice None` dar — wer nur `is_choice()` prüft,
+re-announced endlos. Live verifiziert: BGRx 1920×1080, NVIDIA-Modifier
+`0x0300000000606010`, DMABUF-Frames fließen (`capture_smoke`).
 SPA_PARAM-ids: EnumFormat=3, Format=4, Buffers=5, Meta=6, Latency=15, Tag=17, Props=2.
-Nächste Schritte: Modifier-Support ins EnumFormat; ggf. `pw-cli`/`pw-dot` Inspektion;
-ggf. `lamco-pipewire`-Crate als Referenz.
+**Als Nächstes:** Zero-Copy-Import DMABUF→Encoder (NVENC: EGLImage/CUDA-Interop wegen
+Block-Linear-Modifier; VAAPI: `av_hwframe_map` DRM_PRIME), dann Audio (Opus, 2-Stream-
+FLV), `SyntheticSource` im StreamController ersetzen, `test_driver`-Example.
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`
