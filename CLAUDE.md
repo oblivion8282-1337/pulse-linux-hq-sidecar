@@ -91,9 +91,19 @@ ffmpeg-CUDA-Frame sw_format **BGR0** (NVENC nimmt RGB direkt). FFmpeg-CUDA-Devic
 `AV_CUDA_USE_PRIMARY_CONTEXT` nutzen (hw.rs), sonst fremder CUcontext. Capture-Stop läuft
 über `pw::channel` → `mainloop.quit()` (mpsc weckt den Mainloop nicht → hing ewig).
 Compositor liefert Frames nur bei Damage (statischer Schirm = wenige Frames — kein Bug).
-**Als Nächstes:** VAAPI-Import (`av_hwframe_map` DRM_PRIME, per Analogie), Audio (Opus,
-2-Stream-FLV), `SyntheticSource` im StreamController ersetzen (+ PTS vom Capture-Clock,
-Frame-Duplikation bei fehlendem Damage für CFR), `test_driver`-Example.
+
+**StreamController auf echte Capture verdrahtet** (`start`-Op → Portal-Dialog → PipeWire-
+DMABUF → Zero-Copy-NVENC → RTMPS): live über JSON-RPC verifiziert (`start`/`stop`,
+MediaMTX `ready:true`, ~5 MB in 12 s). Getakteter Loop mit **Frame-Duplikation** hält
+**konstante 60 fps** trotz Damage-getakteter Quelle; PTS = monotoner Frame-Zähler in
+Encoder-Timebase 1/fps. `SyntheticSource` wird nicht mehr benutzt (Struct bleibt).
+Streamt in **nativer Auflösung** (Resolution-Override ⇒ später GPU-Scale). Nur NVIDIA;
+AMD/Intel geben klaren Fehler. Bekannt: `stop` während offenem Portal-Dialog blockt bis
+zur Auswahl. Die FLV-"Failed to update header"-Warnings beim Stop sind harmlos (Live-RTMP
+kann den Header nicht nachschreiben).
+
+**Als Nächstes:** Audio (PipeWire-Audio-Node + Opus + 2-Stream-FLV); VAAPI-Import
+(`av_hwframe_map` DRM_PRIME, per Analogie, hier nicht testbar); `test_driver`-Example.
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`

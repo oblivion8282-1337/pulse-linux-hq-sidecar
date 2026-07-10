@@ -1,16 +1,17 @@
 //! Stream controller — besitzt die eine aktive Capture→Encode→Push-Session.
 //!
-//! `start` spawnt einen Worker-Thread, der die [`VideoEncoder`] + HW-Context
-//! aufbaut, Frames durch den Encoder pumpt (Phase 5: synthetische Quelle, s.
-//! `capture::SyntheticSource`; Phase 6: PipeWire-DMABUFs) und `state`/`fps`/
-//! `error`/`stopped`-Events emittiert. `stop` signalisiert den Worker und joint
-//! ihn. Der Linux-Sidecar self-exit'et nicht nach stop — er bleibt warm.
+//! `start` spawnt einen Worker-Thread, der die echte Capture→Encode→Push-Kette
+//! aufbaut (Portal-Dialog → PipeWire-DMABUF → Zero-Copy-Import → NVENC/VAAPI →
+//! RTMPS), Frames in konstanter Bildrate durch den Encoder pumpt und
+//! `state`/`fps`/`error`/`stopped`-Events emittiert. `stop` signalisiert den
+//! Worker und joint ihn. Der Linux-Sidecar self-exit'et nicht nach stop — er
+//! bleibt warm.
 //!
 //! Threading + Event-Serialisation 1:1 von mac-hq-sidecar (Single-Writer-Thread
 //! via `events::emit`).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -18,7 +19,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use ffmpeg_next as ffmpeg;
 
-use crate::capture::SyntheticSource;
+use crate::capture::pipewire_stream::{DmabufFrame, PipewireCapture};
+use crate::capture::portal;
+use crate::encode::nv_import::NvDmabufImporter;
 use crate::encode::{EncoderConfig, VideoEncoder, hw};
 use crate::events;
 use crate::proto::{Event, StreamState};
@@ -158,7 +161,9 @@ impl StreamController {
     }
 }
 
-/// Worker body: synthetische Quelle → HW-Encode → RTMPS-Push bis stop.
+/// Worker body: Portal→PipeWire-DMABUF→Zero-Copy-Import→HW-Encode→RTMPS-Push
+/// bis stop. Konstante Bildrate durch Frame-Duplikation (Compositor liefert
+/// nur bei Damage; ein Live-Stream braucht CFR).
 fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Result<()> {
     *shared.started_at.lock().unwrap() = Some(Instant::now());
     emit(Event::State {
@@ -167,31 +172,86 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         uptime_s: 0.0,
     });
 
-    let (vendor, render_node) = drm::detect()
-        .ok_or_else(|| anyhow!("keine DRM-Render-Node gefunden"))?;
-    let kind = hw::kind_for(vendor);
-    let dev_arg = if matches!(kind, hw::HwDeviceKind::Vaapi) {
-        Some(render_node.as_str())
-    } else {
-        None
-    };
-    let hw_ctx = hw::HwContext::create(
-        kind,
-        dev_arg,
-        params.width,
-        params.height,
-        ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+    let (vendor, _render_node) =
+        drm::detect().ok_or_else(|| anyhow!("keine DRM-Render-Node gefunden"))?;
+
+    // v1: Der Zero-Copy-Capture-Pfad ist NVENC (EGL/CUDA-Interop). Der
+    // VAAPI-DMABUF-Import (AMD/Intel) folgt separat — bis dahin ein klarer
+    // Fehler statt eines Absturzes.
+    if !matches!(vendor, Vendor::Nvidia) {
+        return Err(anyhow!(
+            "Screen-Capture ist v1 nur für NVIDIA/NVENC verdrahtet — der VAAPI-DMABUF-Import (AMD/Intel) ist noch nicht fertig"
+        ));
+    }
+
+    // 1) Portal-Dialog: User wählt Monitor/Fenster. Blockt bis zur Auswahl.
+    emit(Event::Log {
+        line: "[stream] öffne Portal-Dialog zur Quellenauswahl …".to_string(),
+    });
+    let session = portal::open(true).map_err(|e| {
+        if portal::is_portal_canceled(&e) {
+            anyhow!("Quellenauswahl abgebrochen")
+        } else {
+            anyhow!("Portal-Verhandlung: {e:#}")
+        }
+    })?;
+    emit(Event::Log {
+        line: format!(
+            "[stream] Quelle gewählt: node={} {}x{}",
+            session.node_id, session.width, session.height
+        ),
+    });
+
+    // 2) PipeWire-Capture auf fd + node_id starten.
+    let (rx, mut cap) = PipewireCapture::start(
+        session.pw_fd,
+        session.node_id,
+        session.width,
+        session.height,
     )?;
 
+    // 3) Auf den ersten DMABUF-Frame warten → verbindliche (negotiierte) Maße.
+    let first = rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| anyhow!("kein Bild vom Compositor in 10s (ist die Quelle sichtbar?)"))?;
+    let (width, height) = (first.width, first.height);
+    if width != params.width || height != params.height {
+        emit(Event::Log {
+            line: format!(
+                "[stream] streame in nativer Auflösung {width}x{height} (angefragt {}x{}; Skalierung folgt später)",
+                params.width, params.height
+            ),
+        });
+    }
+
+    // 4) HW-Context (sw_format BGR0 für den Zero-Copy-Import), Encoder, Importer.
+    let hw_ctx = hw::HwContext::create(
+        hw::HwDeviceKind::Cuda,
+        None,
+        width,
+        height,
+        ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
+    )?;
     let cfg = EncoderConfig {
         vendor,
         codec: params.codec.clone(),
         fps: params.fps,
         bitrate_kbps: params.bitrate_kbps,
-        width: params.width,
-        height: params.height,
+        width,
+        height,
     };
     let mut enc = VideoEncoder::create(&cfg, &hw_ctx, &params.push_url)?;
+    let mut importer = NvDmabufImporter::new()?;
+
+    if params.enable_audio {
+        emit(Event::Log {
+            line: "[stream] Audio angefordert, aber noch nicht implementiert (kommt als Nächstes)".to_string(),
+        });
+    }
+
+    // 5) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
+    let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first, &hw_ctx)?;
+    close_planes(&first);
 
     shared.live.store(true, Ordering::SeqCst);
     let started = Instant::now();
@@ -201,46 +261,49 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         uptime_s: 0.0,
     });
 
-    // Audio noch nicht (Phase 6: PipeWire-Audio + Opus). Hinweis via Log.
-    if params.enable_audio {
-        emit(Event::Log {
-            line: "[stream] Audio angefordert, aber noch nicht implementiert (kommt mit PipeWire-Capture, Phase 6)".to_string(),
-        });
-    }
-
-    // swscale BGRA→NV12 (CPU) — einmalig. Phase 6 ersetzt das durch Zero-Copy.
-    let mut scaler = ffmpeg::software::scaling::Context::get(
-        ffmpeg::format::Pixel::BGRA,
-        params.width,
-        params.height,
-        ffmpeg::format::Pixel::NV12,
-        params.width,
-        params.height,
-        ffmpeg::software::scaling::Flags::BILINEAR,
-    )?;
-
-    let mut src = SyntheticSource::new(params.width, params.height, params.fps);
-    let frame_interval = src.frame_interval();
-    let mut next_emit = Instant::now();
+    let frame_interval = Duration::from_secs_f64(1.0 / params.fps.max(1) as f64);
+    let mut next_tick = Instant::now();
+    let mut pts: i64 = 0;
     let mut window_start = Instant::now();
     let mut window_frames = 0u64;
-    let mut pts: i64 = 0;
 
     let run_result = (|| -> Result<()> {
         loop {
             match stop_rx.try_recv() {
-                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
             }
 
-            let bgra = src.next_bgra();
-            let mut nv12 = ffmpeg::frame::Video::empty();
-            scaler.run(&bgra, &mut nv12)?;
-            nv12.set_pts(Some(pts));
+            // Alle seit dem letzten Tick eingetroffenen Frames abholen, nur den
+            // neuesten behalten (Damage kann mehrere geliefert haben; ältere
+            // wären ohnehin veraltet). fds der verworfenen Frames schließen.
+            let mut newest: Option<DmabufFrame> = None;
+            loop {
+                match rx.try_recv() {
+                    Ok(f) => {
+                        if let Some(old) = newest.replace(f) {
+                            close_planes(&old);
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            if let Some(frame) = newest {
+                match importer.import(&frame, &hw_ctx) {
+                    Ok(hw) => {
+                        unsafe { ffmpeg::ffi::av_frame_free(&mut last_hw) };
+                        last_hw = hw;
+                    }
+                    Err(e) => emit(Event::Log {
+                        line: format!("[stream] Frame-Import übersprungen: {e:#}"),
+                    }),
+                }
+                close_planes(&frame);
+            }
 
-            let mut hw_frame = hw_ctx.upload_swframe(&nv12, pts)?;
-            enc.send_hw(hw_frame, pts)?;
-            unsafe { ffmpeg::ffi::av_frame_free(&mut hw_frame) };
+            // Aktuelles (ggf. dupliziertes) Bild encodieren → konstante Bildrate.
+            enc.send_hw(last_hw, pts)?;
             pts += 1;
             window_frames += 1;
 
@@ -252,21 +315,31 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
                 window_frames = 0;
             }
 
-            next_emit += frame_interval;
+            next_tick += frame_interval;
             let now = Instant::now();
-            if next_emit > now {
-                thread::sleep(next_emit - now);
+            if next_tick > now {
+                thread::sleep(next_tick - now);
             } else {
-                next_emit = now;
+                next_tick = now;
             }
         }
         Ok(())
     })();
 
+    // Teardown: Capture stoppen, letztes HW-Frame freigeben, Muxer flushen.
+    cap.stop();
+    unsafe {
+        if !last_hw.is_null() {
+            ffmpeg::ffi::av_frame_free(&mut last_hw);
+        }
+    }
     let finish_result = enc.finish();
     run_result.and(finish_result)
 }
 
-// `Vendor` wird für künftige Vendor-Checks im Modul gebraucht.
-#[allow(unused_imports)]
-use Vendor as _Vendor;
+/// DMABUF-fds eines Frames schließen (wir besitzen die dup'ten fds).
+fn close_planes(f: &DmabufFrame) {
+    for p in &f.planes {
+        unsafe { libc::close(p.fd) };
+    }
+}
