@@ -1,0 +1,10 @@
+# Linux: ffmpeg-sys-next findet das System-FFmpeg (Arch n8.1.2) per pkg-config
+# (libavformat/libavcodec/libavutil liegen in den Standard-Pfaden). Kein
+# FFMPEG_DIR (das ist der Windows-Env-Var-Pfad) und kein Custom-Build nötig —
+# anders als bei macOS, wo SecureTransport RTMPS blockiert und deshalb ein
+# eigener OpenSSL-FFmpeg-Build gepflegt wird. GnuTLS im System-FFmpeg honoriert
+# `tls_verify=0` out-of-the-box.
+#
+# bindgen (transitiv via ffmpeg-sys-next) braucht libclang — liegt auf diesem
+# System als /usr/lib/libclang.so (kein pkg-config-File, aber bindgen findet es
+# über den Library-Suchpfad). Falls woanders → LIBCLANG_PATH setzen.

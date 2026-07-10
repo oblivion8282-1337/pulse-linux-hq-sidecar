@@ -1,0 +1,43 @@
+[package]
+name = "pulse-linux-hq-sidecar"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Pulse Linux HQ-streaming sidecar — stdio JSON-RPC over newline-delimited JSON, mirrors streaming/gsr-sidecar/control.py and the win/mac Rust sidecars. FFmpeg als Bibliothek (VAAPI/NVENC), PipeWire-Capture."
+
+[[bin]]
+name = "pulse-linux-hq-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# FFmpeg als Bibliothek (ab Phase 2: TLS-Probe; Phase 4+: Encode/Mux/RTMPS).
+# Gegen das System-FFmpeg (pkg-config) gelinkt — Arch n8.1.2 mit
+# --enable-gnutls --enable-libdrm --enable-nvenc --enable-vulkan.
+# KEIN `build`-Feature (würde FFmpeg aus Source bauen). `filter` kommt dazu,
+# sobald scale_vaapi für den BGRA→NV12-Convert gebraucht wird (Phase 5).
+ffmpeg-next = { version = "8.1", default-features = false, features = [
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
+
+# Capture (Phase 6): xdg-desktop-portal ScreenCast + PipeWire-DMABUF.
+# ashpd ist async (zbus) — wir scopen einen tokio-Runtime nur für die
+# Portal-Verhandlung, danach läuft der PipeWire-Mainloop synchron.
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+pipewire = "0.10"
+libspa = "0.10"
+drm-fourcc = "2.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

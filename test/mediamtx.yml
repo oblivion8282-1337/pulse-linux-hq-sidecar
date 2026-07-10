@@ -1,0 +1,36 @@
+# Lokales Test-MediaMTX für den Linux-Rust-Sidecar (RTMPS-Ingest + WHEP-Read).
+# KEIN Auth (nur lokal!) — Token-in-URL-Auth ist Prod-Sache (streaming/server).
+# MediaMTX v1.19.x Schema (rtmpServerCert/Key, rtmpsAddress).
+#
+#   1936  RTMPS-Ingest (TLS-only strict, self-signed test/certs/*.pem)
+#   8889  WebRTC/WHEP-Read
+#   8189  WebRTC-ICE (UDP)
+#   9997  API (localhost)
+#
+# Start:   docker compose -f test/docker-compose.yml up -d
+# Stop:    docker compose -f test/docker-compose.yml down
+
+rtmp: true
+rtmpEncryption: "optional"
+rtmpAddress: :1935
+rtmpsAddress: :11936
+rtmpServerKey: /certs/key.pem
+rtmpServerCert: /certs/cert.pem
+
+webrtc: true
+webrtcEncryption: false
+webrtcAddress: :8889
+# ICE-UDP auf :18189 (Default :8189 ist durch `passt` belegt).
+webrtcLocalUDPAddress: :18189
+webrtcAdditionalHosts: [127.0.0.1]
+
+api: true
+apiEncryption: false
+apiAddress: :9997
+
+logLevel: info
+logDestinations: [stdout]
+
+# Alle Pfade erlaubt (lokaler Dev-Test — Prod hat authHTTP + channel-Pfade).
+paths:
+  all_others:

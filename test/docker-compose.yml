@@ -1,0 +1,11 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: pulse-linux-sidecar-mediamtx
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+      - ./certs:/certs:ro
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"

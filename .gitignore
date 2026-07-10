@@ -1,0 +1,14 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Test-Smoke-Ausgaben
+*.mp4
+/test/mediamtx.yml.local
+
+# Self-signed Test-Certs (regenerierbar — KEINE Private Keys ins Repo!)
+/test/certs/
+
+# Editor/OS
+.*.swp
+.DS_Store
