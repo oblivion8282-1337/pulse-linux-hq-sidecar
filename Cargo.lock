@@ -808,6 +808,7 @@ dependencies = [
  "drm-fourcc",
  "ffmpeg-next",
  "libc",
+ "libloading",
  "libspa",
  "pipewire",
  "serde",

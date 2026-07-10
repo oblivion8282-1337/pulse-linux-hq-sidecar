@@ -56,9 +56,11 @@ fn main() {
                     .map(|p| format!("fd={} off={} stride={}", p.fd, p.offset, p.stride))
                     .collect();
                 println!(
-                    "[capture_smoke] frame {i}: {}x{} planes=[{}]",
+                    "[capture_smoke] frame {i}: {}x{} fourcc={:#010x} modifier={:#018x} planes=[{}]",
                     f.width,
                     f.height,
+                    f.drm_fourcc,
+                    f.modifier,
                     planes.join(", ")
                 );
                 // fds schließen (Smoke verbraucht sie nicht).

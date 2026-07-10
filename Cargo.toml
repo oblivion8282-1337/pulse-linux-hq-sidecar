@@ -30,11 +30,16 @@ ffmpeg-next = { version = "8.1", default-features = false, features = [
 # ashpd ist async (zbus) — wir scopen einen tokio-Runtime nur für die
 # Portal-Verhandlung, danach läuft der PipeWire-Mainloop synchron.
 ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
-pipewire = "0.10"
-libspa = "0.10"
+# v0_3_33: PropertyFlags::DONT_FIXATE für die DMABUF-Modifier-Verhandlung
+# (System-PipeWire ist 1.6.7, weit drüber).
+pipewire = { version = "0.10", features = ["v0_3_33"] }
+libspa = { version = "0.10", features = ["v0_3_33"] }
 drm-fourcc = "2.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 libc = "0.2"
+# EGL-dlopen für eglQueryDmaBufModifiersEXT (Modifier-Liste fürs EnumFormat,
+# wie GSR) — kein Link-Time-Dep auf libEGL.
+libloading = "0.8"
 
 [profile.release]
 opt-level = 3
