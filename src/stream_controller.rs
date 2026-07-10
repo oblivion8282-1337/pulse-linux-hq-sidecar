@@ -399,7 +399,6 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     };
 
     shared.live.store(true, Ordering::SeqCst);
-    let started = record_start;
     emit(Event::State {
         state: StreamState::Live,
         running: true,
@@ -432,8 +431,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
                             close_planes(&old);
                         }
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
             }
             if let Some(frame) = newest {
@@ -466,7 +464,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             if window_start.elapsed() >= Duration::from_secs(1) {
                 let fps = window_frames as f64 / window_start.elapsed().as_secs_f64();
                 shared.fps_milli.store((fps * 1000.0) as u64, Ordering::SeqCst);
-                emit(Event::Fps { fps, uptime_s: started.elapsed().as_secs_f64() });
+                emit(Event::Fps { fps, uptime_s: record_start.elapsed().as_secs_f64() });
                 window_start = Instant::now();
                 window_frames = 0;
             }

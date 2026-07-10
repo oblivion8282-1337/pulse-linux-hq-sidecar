@@ -27,3 +27,14 @@ pub mod list_windows;
 pub mod start;
 pub mod state;
 pub mod stop;
+
+use serde_json::{Map, Value};
+
+/// Flatten a `json!({...})` object into the field-map an op handler returns.
+/// A non-object (never produced by the handlers) yields an empty map.
+pub(crate) fn json_to_map(v: Value) -> Map<String, Value> {
+    match v {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    }
+}

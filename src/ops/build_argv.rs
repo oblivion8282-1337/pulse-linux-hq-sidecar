@@ -11,6 +11,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 
 use crate::profiles::profile_by_name;
+use crate::redact::redact_url;
 
 pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
     let profile_name = params
@@ -91,22 +92,7 @@ fn build_argv(
         "--resolution".to_string(),
         resolution.to_string(),
         "--out".to_string(),
-        redact(push_url),
+        redact_url(push_url),
     ];
     argv
-}
-
-fn redact(url: &str) -> String {
-    let mut s = url.to_string();
-    for pat in ["pass=", "token=", "streamid=publish:"] {
-        if let Some(idx) = s.find(pat) {
-            let start = idx + pat.len();
-            let end = s[start..]
-                .find(|c: char| c == '&' || c == ' ')
-                .map(|i| start + i)
-                .unwrap_or(s.len());
-            s.replace_range(start..end, "***");
-        }
-    }
-    s
 }

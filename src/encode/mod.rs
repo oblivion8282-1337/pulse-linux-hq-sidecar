@@ -114,8 +114,9 @@ impl VideoEncoder {
         encoder.set_format(hw_pixel);
         encoder.set_time_base(Rational::new(1, cfg.fps as i32));
         encoder.set_frame_rate(Some(Rational::new(cfg.fps as i32, 1)));
-        encoder.set_bit_rate((cfg.bitrate_kbps as usize).saturating_mul(1000));
-        encoder.set_max_bit_rate((cfg.bitrate_kbps as usize).saturating_mul(1000));
+        let bitrate_bps = (cfg.bitrate_kbps as usize).saturating_mul(1000);
+        encoder.set_bit_rate(bitrate_bps);
+        encoder.set_max_bit_rate(bitrate_bps);
         encoder.set_gop(cfg.fps.saturating_mul(2)); // keyint=2.0s (GSR)
         // Low-Latency: kein B-Frame (GSR Performance-Tune).
         encoder.set_max_b_frames(0);
@@ -143,13 +144,13 @@ impl VideoEncoder {
 
         // Audio-Stream VOR write_header hinzufügen (der Video-Stream-Borrow ist
         // nach set_parameters freigegeben).
-        let mut audio_enc = match &audio {
-            Some(a) => Some(
+        let mut audio_enc = audio
+            .as_ref()
+            .map(|a| {
                 AudioEncoder::create(&mut output, a.sample_rate, a.bitrate_kbps)
-                    .context("create audio encoder")?,
-            ),
-            None => None,
-        };
+                    .context("create audio encoder")
+            })
+            .transpose()?;
 
         output.write_header().context("write_header")?;
 

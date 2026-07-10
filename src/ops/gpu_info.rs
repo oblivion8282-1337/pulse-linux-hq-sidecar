@@ -17,17 +17,10 @@ pub fn handle(_params: Map<String, Value>) -> Result<Map<String, Value>> {
         None => (Value::String("unknown".to_string()), Value::Null),
     };
 
-    Ok(json_to_map(json!({
+    Ok(super::json_to_map(json!({
         "vendor": vendor,
         "card_path": card_path,
         "display_server": std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
         "video_codecs": caps::available_video_codecs(),
     })))
-}
-
-fn json_to_map(v: Value) -> Map<String, Value> {
-    match v {
-        Value::Object(m) => m,
-        _ => Map::new(),
-    }
 }

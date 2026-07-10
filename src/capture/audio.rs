@@ -131,16 +131,10 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
             }
             if let Some(bytes) = data.data() {
                 let n = size.min(bytes.len()) / std::mem::size_of::<f32>();
-                let mut samples = Vec::with_capacity(n);
-                for i in 0..n {
-                    let off = i * 4;
-                    samples.push(f32::from_le_bytes([
-                        bytes[off],
-                        bytes[off + 1],
-                        bytes[off + 2],
-                        bytes[off + 3],
-                    ]));
-                }
+                let samples: Vec<f32> = bytes[..n * 4]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
                 // Fehlt der Consumer, ist der Stream vorbei — Fehler ignorieren.
                 let _ = ud.sample_tx.send(samples);
             }
