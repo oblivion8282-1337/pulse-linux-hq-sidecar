@@ -131,8 +131,17 @@ Read-Ops + unknown-op + invalid-json, verifiziert Wire-Protokoll; grün in ~130 
 `health`, `video_only`/`audio_mux`/`av1_mux` (Portal-Dialog). `$PULSE_HQ_SIDECAR_BIN`
 überschreibt den Bin-Pfad. Kein HEVC-Szenario (nur H264+AV1).
 
-**Als Nächstes:** A/V-Anchoring (`av_offset_ms` real anwenden); VAAPI auf echter
-AMD/Intel-Hardware verifizieren; Resolution-Override → GPU-Scale.
+**A/V-Sync über gemeinsame Wanduhr** (GSR-Modell): Video- UND Audio-pts leiten aus
+demselben `record_start`-Instant ab. Video-pts = `round((now-record_start)*fps)` (nicht
+mehr simpler Zähler → kein Sleep-Drift), strikt monoton via `max(next_pts)`. Audio: der
+erste Sample-Batch verankert die Zeitlinie an `(arrival-record_start)*sample_rate` (+
+`av_offset_ms`). Kein fixer Encoder-Delay (wie GSRs `force_no_audio_offset` bei
+Livestream). `av_offset_ms` ist jetzt funktionaler Feinabgleich (positiv = Ton später).
+Verifiziert (RTSP-Aufnahme, Paket-PTS): beide Spuren enden nach 15 s auf **16 ms genau** →
+kein Drift. (`start_time`-Diff in Mid-Stream-Aufnahmen = Keyframe-Artefakt, GOP=2s.)
+
+**Als Nächstes:** VAAPI auf echter AMD/Intel-Hardware verifizieren; Resolution-Override →
+GPU-Scale; ggf. Audio-Silence-Insertion bei PipeWire-xruns (GSR macht das gegen Drift).
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`

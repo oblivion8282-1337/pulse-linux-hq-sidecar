@@ -71,15 +71,36 @@ struct AudioPipeline {
 }
 
 impl AudioPipeline {
-    fn start(mut enc: AudioEncoder, mux: MuxSender) -> Result<Self> {
+    /// `record_start`: gemeinsamer Monotonic-Nullpunkt mit dem Video-Loop (GSR-
+    /// Modell — beide Spuren ankern an DERSELBEN Uhr). `av_offset_ms`: manueller
+    /// Feinabgleich (positiv = Ton später).
+    fn start(
+        mut enc: AudioEncoder,
+        mux: MuxSender,
+        record_start: Instant,
+        av_offset_ms: i32,
+    ) -> Result<Self> {
         let (rx, cap) = AudioCapture::start()?;
         let worker = thread::Builder::new()
             .name("hq-audio-encode".into())
             .spawn(move || {
-                // Samples pullen und in Opus-Frames encoden, bis der
-                // Capture-Thread stoppt (Channel schließt).
+                // Der erste Sample-Batch verankert die Audio-Zeitlinie: sein
+                // Empfangszeitpunkt relativ zu record_start (in Samples) wird
+                // der pts des ersten Opus-Frames. So beginnt Audio bei genau der
+                // Video-Zeit, zu der es wirklich einsetzt — kein fixer Offset
+                // (GSR schaltet den bei Livestream auch ab: force_no_audio_offset).
+                let offset_samples =
+                    av_offset_ms as i64 * audio::SAMPLE_RATE as i64 / 1000;
+                let mut anchored = false;
                 while let Ok(samples) = rx.recv() {
-                    if let Err(e) = enc.push(&samples, &mux, 0) {
+                    let anchor = if anchored {
+                        0 // nach dem ersten push ignoriert AudioEncoder den Wert
+                    } else {
+                        anchored = true;
+                        let elapsed = record_start.elapsed().as_secs_f64();
+                        (elapsed * audio::SAMPLE_RATE as f64) as i64 + offset_samples
+                    };
+                    if let Err(e) = enc.push(&samples, &mux, anchor) {
                         emit(Event::Log { line: format!("[audio] push: {e:#}") });
                         break;
                     }
@@ -330,20 +351,30 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     let (mut enc, audio_enc) =
         VideoEncoder::create_with_audio(&cfg, hw_pixel, frames_ctx, &params.push_url, audio_params)?;
 
-    if params.av_offset_ms != 0 {
-        emit(Event::Log {
-            line: format!(
-                "[stream] av_offset_ms={} noch nicht angewandt (A/V-Anchoring folgt)",
-                params.av_offset_ms
-            ),
-        });
-    }
+    // 6) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
+    let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first)?;
+    close_planes(&first);
 
-    // Audio-Nebenpfad starten (teilt sich den Muxer über einen MuxSender).
+    // 7) GEMEINSAMER Zeit-Nullpunkt für Video UND Audio (GSR-Modell): beide
+    //    Spuren leiten ihre pts aus DERSELBEN Monotonic-Uhr ab → kein Drift,
+    //    kein fixer Audio-Offset nötig. Direkt vor „live" gesetzt, nachdem der
+    //    erste Frame bereit ist (= Content-Start).
+    let record_start = Instant::now();
+
+    // Audio-Nebenpfad starten (teilt sich den Muxer über einen MuxSender),
+    // verankert an record_start + av_offset_ms.
     let mut audio_pipeline = match audio_enc {
-        Some(ae) => match enc.mux_sender().and_then(|s| AudioPipeline::start(ae, s)) {
+        Some(ae) => match enc
+            .mux_sender()
+            .and_then(|s| AudioPipeline::start(ae, s, record_start, params.av_offset_ms))
+        {
             Ok(p) => {
-                emit(Event::Log { line: "[stream] Audio: Sink-Monitor → Opus".to_string() });
+                let off = if params.av_offset_ms != 0 {
+                    format!(" (av_offset={}ms)", params.av_offset_ms)
+                } else {
+                    String::new()
+                };
+                emit(Event::Log { line: format!("[stream] Audio: Sink-Monitor → Opus{off}") });
                 Some(p)
             }
             Err(e) => {
@@ -354,12 +385,8 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         None => None,
     };
 
-    // 6) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
-    let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first)?;
-    close_planes(&first);
-
     shared.live.store(true, Ordering::SeqCst);
-    let started = Instant::now();
+    let started = record_start;
     emit(Event::State {
         state: StreamState::Live,
         running: true,
@@ -368,7 +395,9 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
 
     let frame_interval = Duration::from_secs_f64(1.0 / params.fps.max(1) as f64);
     let mut next_tick = Instant::now();
-    let mut pts: i64 = 0;
+    // Nächster erlaubter pts (strikte Monotonie-Untergrenze). Der reale pts wird
+    // pro Tick aus record_start abgeleitet (s. u.), nicht simpel hochgezählt.
+    let mut next_pts: i64 = 0;
     let mut window_start = Instant::now();
     let mut window_frames = 0u64;
 
@@ -407,9 +436,18 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
                 close_planes(&frame);
             }
 
-            // Aktuelles (ggf. dupliziertes) Bild encodieren → konstante Bildrate.
+            // Video-pts aus DERSELBEN Uhr wie der Audio-Anker ableiten (GSR:
+            // `pts = (now - record_start) * fps`), nicht simpel hochzählen —
+            // sonst driftet das sleep-basierte Pacing gegen die echte
+            // Audio-Zeit. `max(next_pts)` erzwingt strikte Monotonie (falls ein
+            // Tick minimal zu früh kommt).
+            let clock_pts =
+                (record_start.elapsed().as_secs_f64() * params.fps.max(1) as f64).round() as i64;
+            let pts = clock_pts.max(next_pts);
+            next_pts = pts + 1;
+
+            // Aktuelles (ggf. dupliziertes) Bild encodieren.
             enc.send_hw(last_hw, pts)?;
-            pts += 1;
             window_frames += 1;
 
             if window_start.elapsed() >= Duration::from_secs(1) {
