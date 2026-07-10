@@ -309,7 +309,7 @@ impl NvDmabufImporter {
                 } else {
                     CStr::from_ptr(version_ptr).to_string_lossy().into_owned()
                 };
-                eprintln!("[nv-import] EGL-Device-GL: {vendor}");
+                tracing::debug!(target: "nvenc", "EGL-Device-GL: {vendor}");
                 if vendor.to_ascii_lowercase().contains("nvidia") {
                     found = Some((dpy, ctx));
                     break;

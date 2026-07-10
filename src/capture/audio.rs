@@ -48,7 +48,7 @@ impl AudioCapture {
             .name("pipewire-audio".into())
             .spawn(move || {
                 if let Err(e) = run_audio(sample_tx, stop_rx) {
-                    eprintln!("[pipewire-audio] error: {e:#}");
+                    tracing::error!(target: "audio", "Audio-Capture-Thread: {e:#}");
                 }
             })?;
         Ok((sample_rx, Self { stop_tx, worker: Some(worker) }))
@@ -96,7 +96,7 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(|_s, _ud, old, new| {
-            eprintln!("[pipewire-audio] state: {old:?} -> {new:?}");
+            tracing::debug!(target: "audio", "PW-State: {old:?} -> {new:?}");
         })
         .param_changed(|_s, ud, id, param| {
             let Some(param) = param else { return };
@@ -110,10 +110,11 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
                 return;
             }
             if ud.info.parse(param).is_ok() {
-                eprintln!(
-                    "[pipewire-audio] Format: {}Hz {}ch",
-                    ud.info.rate(),
-                    ud.info.channels()
+                tracing::info!(
+                    target: "audio",
+                    rate = ud.info.rate(),
+                    channels = ud.info.channels(),
+                    "Audio-Format ausgehandelt"
                 );
             }
         })
@@ -170,8 +171,8 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
         &mut params,
     )?;
 
-    eprintln!("[pipewire-audio] connected, running mainloop …");
+    tracing::info!(target: "audio", "Audio-Capture verbunden, Mainloop läuft");
     mainloop.run();
-    eprintln!("[pipewire-audio] mainloop beendet (stop)");
+    tracing::debug!(target: "audio", "Audio-Mainloop beendet (stop)");
     Ok(())
 }

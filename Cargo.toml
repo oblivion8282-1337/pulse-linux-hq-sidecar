@@ -14,6 +14,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
+# Diagnose-Logging auf stderr (Pulse tee't das in sidecar.log). Stufen +
+# Modul-Targets, gesteuert über $PULSE_HQ_LOG (wie RUST_LOG). Siehe src/logging.rs.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "fmt",
+    "ansi",
+    "env-filter",
+] }
+
 # FFmpeg als Bibliothek (ab Phase 2: TLS-Probe; Phase 4+: Encode/Mux/RTMPS).
 # Gegen das System-FFmpeg (pkg-config) gelinkt — Arch n8.1.2 mit
 # --enable-gnutls --enable-libdrm --enable-nvenc --enable-vulkan.

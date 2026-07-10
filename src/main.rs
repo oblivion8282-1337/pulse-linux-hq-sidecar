@@ -16,9 +16,19 @@
 use std::io::{self, BufRead, Write};
 use std::thread;
 
-use pulse_linux_hq_sidecar::{dispatch, events};
+use pulse_linux_hq_sidecar::{dispatch, events, logging};
 
 fn main() -> anyhow::Result<()> {
+    // Diagnose-Logging (stderr) VOR allem anderen — Pulse tee't stderr in
+    // sidecar.log. stdout bleibt exklusiv dem JSON-RPC-Protokoll.
+    logging::init();
+    tracing::info!(
+        target: "stream",
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        "pulse-linux-hq-sidecar startet"
+    );
+
     let (out_tx, out_rx) = std::sync::mpsc::channel::<serde_json::Value>();
     events::init(out_tx.clone());
 
@@ -32,7 +42,7 @@ fn main() -> anyhow::Result<()> {
                 let json = match serde_json::to_string(&value) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[linux-hq-sidecar] failed to serialize event: {e}");
+                        tracing::error!(target: "stream", error = %e, "Event-Serialisierung fehlgeschlagen");
                         continue;
                     }
                 };
@@ -71,7 +81,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("[linux-hq-sidecar] failed to serialize response: {e}");
+                tracing::error!(target: "stream", error = %e, "Response-Serialisierung fehlgeschlagen");
             }
         }
     }

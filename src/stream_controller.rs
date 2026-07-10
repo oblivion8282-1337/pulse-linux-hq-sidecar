@@ -163,7 +163,20 @@ pub struct StreamController {
 
 static INSTANCE: OnceLock<StreamController> = OnceLock::new();
 
+/// Schickt ein Event aufs Protokoll (stdout) UND spiegelt es ins Diagnose-Log
+/// (stderr → Pulse `sidecar.log`), damit der Verlauf eines Streams auch ohne
+/// sichtbares Stream-Log-Fenster nachvollziehbar ist. `fps` bewusst nur auf
+/// `debug` (sonst 60 Zeilen/s Rauschen).
 fn emit(event: Event) {
+    match &event {
+        Event::Log { line } => tracing::info!(target: "stream", "{line}"),
+        Event::Error { message } => tracing::error!(target: "stream", "{message}"),
+        Event::State { state, running, .. } => {
+            tracing::info!(target: "stream", ?state, running, "state")
+        }
+        Event::Stopped { code } => tracing::info!(target: "stream", ?code, "stopped"),
+        Event::Fps { fps, .. } => tracing::debug!(target: "stream", fps, "fps"),
+    }
     if let Ok(v) = serde_json::to_value(event) {
         events::emit(v);
     }

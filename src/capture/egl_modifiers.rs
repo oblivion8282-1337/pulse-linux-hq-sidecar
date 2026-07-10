@@ -45,7 +45,7 @@ pub fn query_dmabuf_modifiers(fourccs: &[u32]) -> HashMap<u32, Vec<u64>> {
     let mut out: HashMap<u32, Vec<u64>> = HashMap::new();
 
     if let Err(e) = query_into(fourccs, &mut out) {
-        eprintln!("[egl-modifiers] EGL-Abfrage fehlgeschlagen ({e}) — Fallback LINEAR/INVALID");
+        tracing::warn!(target: "egl", "EGL-Modifier-Abfrage fehlgeschlagen ({e}) — Fallback LINEAR/INVALID");
     }
 
     for &fourcc in fourccs {

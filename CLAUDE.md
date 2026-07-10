@@ -52,6 +52,10 @@ main.rs, profiles.rs, encode/mux_writer.rs, ops/{list_profiles,stop,state}.rs`.
 - `Request::response()` ist **synchrone** Methode auf `ashpd::Request` (kein `.await`).
 
 ## Build & Test
+Diagnose-Logging (`src/logging.rs`, `tracing`): geht auf **stderr** (stdout = nur
+JSON-RPC), Pulse tee't das in `sidecar.log`. Stufen/Targets via `PULSE_HQ_LOG` (wie
+`RUST_LOG`), Default `info` — z.B. `PULSE_HQ_LOG=info,pipewire=debug,nvenc=debug`. Targets:
+`pipewire, nvenc, vaapi, audio, egl, stream, mux`. Token-Redaction: `src/redact.rs`.
 ```bash
 cargo build --release
 echo '{"op":"health","id":1}' | ./target/release/pulse-linux-hq-sidecar

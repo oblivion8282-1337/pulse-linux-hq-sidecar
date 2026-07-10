@@ -97,7 +97,7 @@ impl PipewireCapture {
             .name("pipewire-capture".into())
             .spawn(move || {
                 if let Err(e) = run_pipewire(pw_fd, node_id, width, height, frame_tx, stop_rx) {
-                    eprintln!("[pipewire-capture] error: {e:#}");
+                    tracing::error!(target: "pipewire", "Capture-Thread: {e:#}");
                 }
             })?;
         Ok((frame_rx, Self { stop_tx, worker: Some(worker) }))
@@ -262,8 +262,9 @@ fn run_pipewire(
         .collect();
     let modifier_map = egl_modifiers::query_dmabuf_modifiers(&fourccs);
     for (fourcc, mods) in &modifier_map {
-        eprintln!(
-            "[pipewire] fourcc {:#010x}: {} modifier ({:#018x} …)",
+        tracing::debug!(
+            target: "pipewire",
+            "fourcc {:#010x}: {} Modifier ({:#018x} …)",
             fourcc,
             mods.len(),
             mods.first().copied().unwrap_or(0)
@@ -308,17 +309,17 @@ fn run_pipewire(
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(|_s, _ud, old, new| {
-            eprintln!("[pipewire] state: {old:?} -> {new:?}");
+            tracing::debug!(target: "pipewire", "PW-State: {old:?} -> {new:?}");
         })
         .param_changed(|s, ud, id, param| {
-            eprintln!("[pipewire] param_changed id={id} param={}", param.is_some());
+            tracing::debug!(target: "pipewire", "param_changed id={id} param={}", param.is_some());
             let Some(param) = param else { return };
             if id != ParamType::Format.as_raw() {
                 return;
             }
 
             let Ok((_, value)) = PodDeserializer::deserialize_any_from(param.as_bytes()) else {
-                eprintln!("[pipewire] Format-Deserialize fehlgeschlagen");
+                tracing::warn!(target: "pipewire", "Format-Deserialize fehlgeschlagen");
                 return;
             };
             let Value::Object(mut obj) = value else { return };
@@ -337,8 +338,9 @@ fn run_pipewire(
                 ModifierState::Unfixated(default) => {
                     if ud.announced_modifier != Some(default) {
                         ud.announced_modifier = Some(default);
-                        eprintln!(
-                            "[pipewire] Format mit Modifier-Choice → fixiere auf {default:#018x}"
+                        tracing::debug!(
+                            target: "pipewire",
+                            "Format mit Modifier-Choice → fixiere auf {default:#018x}"
                         );
                         obj.id = ParamType::EnumFormat.as_raw();
                         if let Some(prop) = obj
@@ -366,8 +368,9 @@ fn run_pipewire(
                         let _ = s.update_params(&mut pods);
                         return;
                     }
-                    eprintln!(
-                        "[pipewire] Modifier-Choice nach Fixierung — akzeptiere Default {default:#018x}"
+                    tracing::debug!(
+                        target: "pipewire",
+                        "Modifier-Choice nach Fixierung — akzeptiere Default {default:#018x}"
                     );
                     (true, default)
                 }
@@ -376,7 +379,7 @@ fn run_pipewire(
             // Fixiertes Format: echte Größe/Format/Modifier übernehmen.
             let mut info = VideoInfoRaw::new();
             if info.parse(param).is_err() {
-                eprintln!("[pipewire] Format-Parse fehlgeschlagen");
+                tracing::warn!(target: "pipewire", "Format-Parse fehlgeschlagen");
                 return;
             }
             ud.width = info.size().width;
@@ -385,13 +388,14 @@ fn run_pipewire(
             ud.drm_fourcc = video_format_to_drm_fourcc(info.format())
                 .map(|f| f as u32)
                 .unwrap_or(0);
-            eprintln!(
-                "[pipewire] Format fixiert: {:?} {}x{} modifier={:#018x} dmabuf={}",
-                info.format(),
-                ud.width,
-                ud.height,
-                ud.modifier,
-                has_modifier
+            tracing::info!(
+                target: "pipewire",
+                format = ?info.format(),
+                width = ud.width,
+                height = ud.height,
+                modifier = format!("{:#018x}", ud.modifier),
+                dmabuf = has_modifier,
+                "Format fixiert"
             );
 
             // ParamBuffers: mit Modifier ist DMABUF verhandelt → nur DmaBuf
@@ -418,8 +422,9 @@ fn run_pipewire(
             if datas[0].type_() != DataType::DmaBuf {
                 if !ud.shm_warned {
                     ud.shm_warned = true;
-                    eprintln!(
-                        "[pipewire] Buffer-Typ {:?} (kein DmaBuf) — SHM-Consumer noch nicht implementiert",
+                    tracing::warn!(
+                        target: "pipewire",
+                        "Buffer-Typ {:?} (kein DmaBuf) — SHM-Consumer noch nicht implementiert",
                         datas[0].type_()
                     );
                 }
@@ -471,8 +476,8 @@ fn run_pipewire(
         &mut params,
     )?;
 
-    eprintln!("[pipewire] stream connected to node {node_id}, running mainloop …");
+    tracing::info!(target: "pipewire", node_id, "Stream verbunden, Mainloop läuft");
     mainloop.run();
-    eprintln!("[pipewire] mainloop beendet (stop)");
+    tracing::debug!(target: "pipewire", "Mainloop beendet (stop)");
     Ok(())
 }

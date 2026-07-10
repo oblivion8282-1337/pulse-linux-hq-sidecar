@@ -63,7 +63,7 @@ impl MuxWriter {
                 let mut output = out.0;
                 for pkt in rx {
                     if let Err(e) = pkt.0.write_interleaved(&mut output) {
-                        eprintln!("[mux-writer] write_interleaved failed: {e:#}");
+                        tracing::error!(target: "mux", "write_interleaved fehlgeschlagen: {e:#}");
                         return Err(e).context("mux-writer: write_interleaved");
                     }
                     // Push the bytes onto the wire after every packet (live

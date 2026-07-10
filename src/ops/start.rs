@@ -134,21 +134,6 @@ fn build_redacted_argv(
         "--bitrate".to_string(),
         format!("{bitrate_kbps}k"),
         "--out".to_string(),
-        redact(push_url),
+        crate::redact::redact_url(push_url),
     ]
-}
-
-fn redact(url: &str) -> String {
-    let mut s = url.to_string();
-    for pat in ["pass=", "token=", "streamid=publish:"] {
-        if let Some(idx) = s.find(pat) {
-            let start = idx + pat.len();
-            let end = s[start..]
-                .find(|c: char| c == '&' || c == ' ')
-                .map(|i| start + i)
-                .unwrap_or(s.len());
-            s.replace_range(start..end, "***");
-        }
-    }
-    s
 }
