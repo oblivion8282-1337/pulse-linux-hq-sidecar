@@ -124,8 +124,15 @@ verzweigt über ein `FrameImporter`-Enum (Nvenc/Vaapi). Bruchstellen mit `// UNV
 markiert (DRM-hwframe-init, Deskriptor-`size`, hwmap-derive). NVIDIA-Regression nach dem
 Umbau OK (tracks H264+Opus, 60 fps, bytes steigen).
 
-**Als Nächstes:** `test_driver`-Example; A/V-Anchoring (`av_offset_ms` real anwenden);
-VAAPI auf echter AMD/Intel-Hardware verifizieren.
+**`test_driver`-Example** (`examples/test_driver.rs`, portiert aus win-hq-sidecar):
+spawnt das Binary, redet JSON-RPC über stdin/stdout, tee't zeitgestempelt in
+Konsole+Logfile. Szenarien: `protocol` (default, **nicht-interaktiv** — sweep über alle
+Read-Ops + unknown-op + invalid-json, verifiziert Wire-Protokoll; grün in ~130 ms),
+`health`, `video_only`/`audio_mux`/`av1_mux` (Portal-Dialog). `$PULSE_HQ_SIDECAR_BIN`
+überschreibt den Bin-Pfad. Kein HEVC-Szenario (nur H264+AV1).
+
+**Als Nächstes:** A/V-Anchoring (`av_offset_ms` real anwenden); VAAPI auf echter
+AMD/Intel-Hardware verifizieren; Resolution-Override → GPU-Scale.
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`
