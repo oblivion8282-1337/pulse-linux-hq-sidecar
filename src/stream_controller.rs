@@ -19,13 +19,58 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use ffmpeg_next as ffmpeg;
 
+use crate::capture::audio::{self, AudioCapture};
 use crate::capture::pipewire_stream::{DmabufFrame, PipewireCapture};
 use crate::capture::portal;
+use crate::encode::audio::AudioEncoder;
+use crate::encode::mux_writer::MuxSender;
 use crate::encode::nv_import::NvDmabufImporter;
-use crate::encode::{EncoderConfig, VideoEncoder, hw};
+use crate::encode::{AudioParams, EncoderConfig, VideoEncoder, hw};
 use crate::events;
 use crate::proto::{Event, StreamState};
 use crate::system::drm::{self, Vendor};
+
+/// Standard-Audio-Bitrate (Opus), bis Profile eine eigene mitliefern.
+const AUDIO_BITRATE_KBPS: u32 = 128;
+
+/// Audio-Nebenpfad: PipeWire-Sink-Monitor → Opus → Muxer. Läuft auf zwei
+/// Threads (PW-Capture + Encode) parallel zum Video-Pacing-Loop.
+struct AudioPipeline {
+    cap: AudioCapture,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AudioPipeline {
+    fn start(mut enc: AudioEncoder, mux: MuxSender) -> Result<Self> {
+        let (rx, cap) = AudioCapture::start()?;
+        let worker = thread::Builder::new()
+            .name("hq-audio-encode".into())
+            .spawn(move || {
+                // Samples pullen und in Opus-Frames encoden, bis der
+                // Capture-Thread stoppt (Channel schließt).
+                while let Ok(samples) = rx.recv() {
+                    if let Err(e) = enc.push(&samples, &mux, 0) {
+                        emit(Event::Log { line: format!("[audio] push: {e:#}") });
+                        break;
+                    }
+                }
+                if let Err(e) = enc.flush(&mux) {
+                    emit(Event::Log { line: format!("[audio] flush: {e:#}") });
+                }
+                // `mux` (MuxSender) droppt hier → gibt den Muxer-Trailer frei.
+            })
+            .map_err(|e| anyhow!("spawn hq-audio-encode: {e}"))?;
+        Ok(Self { cap, worker: Some(worker) })
+    }
+
+    /// Capture stoppen (→ Sample-Channel schließt → Encode-Thread flush+Ende).
+    fn stop(&mut self) {
+        self.cap.stop();
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
 
 /// Aufgelöste Parameter für einen Stream (gebaut von `ops::start`).
 pub struct StartParams {
@@ -240,14 +285,37 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         width,
         height,
     };
-    let mut enc = VideoEncoder::create(&cfg, &hw_ctx, &params.push_url)?;
+    let audio_params = params.enable_audio.then(|| AudioParams {
+        sample_rate: audio::SAMPLE_RATE,
+        bitrate_kbps: AUDIO_BITRATE_KBPS,
+    });
+    let (mut enc, audio_enc) =
+        VideoEncoder::create_with_audio(&cfg, &hw_ctx, &params.push_url, audio_params)?;
     let mut importer = NvDmabufImporter::new()?;
 
-    if params.enable_audio {
+    if params.av_offset_ms != 0 {
         emit(Event::Log {
-            line: "[stream] Audio angefordert, aber noch nicht implementiert (kommt als Nächstes)".to_string(),
+            line: format!(
+                "[stream] av_offset_ms={} noch nicht angewandt (A/V-Anchoring folgt)",
+                params.av_offset_ms
+            ),
         });
     }
+
+    // Audio-Nebenpfad starten (teilt sich den Muxer über einen MuxSender).
+    let mut audio_pipeline = match audio_enc {
+        Some(ae) => match enc.mux_sender().and_then(|s| AudioPipeline::start(ae, s)) {
+            Ok(p) => {
+                emit(Event::Log { line: "[stream] Audio: Sink-Monitor → Opus".to_string() });
+                Some(p)
+            }
+            Err(e) => {
+                emit(Event::Log { line: format!("[stream] Audio deaktiviert ({e:#})") });
+                None
+            }
+        },
+        None => None,
+    };
 
     // 5) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
     let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first, &hw_ctx)?;
@@ -326,8 +394,13 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         Ok(())
     })();
 
-    // Teardown: Capture stoppen, letztes HW-Frame freigeben, Muxer flushen.
+    // Teardown: Video- und Audio-Capture stoppen. Audio ZUERST beenden, damit
+    // sein MuxSender droppt — sonst kann der Muxer-Trailer (write_trailer beim
+    // Drop des letzten Senders) in enc.finish() nicht schreiben.
     cap.stop();
+    if let Some(mut ap) = audio_pipeline.take() {
+        ap.stop();
+    }
     unsafe {
         if !last_hw.is_null() {
             ffmpeg::ffi::av_frame_free(&mut last_hw);

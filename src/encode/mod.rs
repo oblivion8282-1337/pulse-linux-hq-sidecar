@@ -9,6 +9,7 @@
 //! Phase 4 (diese Datei): Video-only, synthetische Frames → Datei. Audio + der
 //! asynchrone Pacing-Loop + RTMPS-Push kommen in Phase 5.
 
+pub mod audio;
 pub mod hw;
 pub mod mux_writer;
 pub mod nv_import;
@@ -18,9 +19,17 @@ use anyhow::{Context, Result, anyhow};
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{Dictionary, Packet, Rational, codec, format, ffi::*};
 
+use audio::AudioEncoder;
 use hw::HwContext;
-use mux_writer::MuxWriter;
+use mux_writer::{MuxSender, MuxWriter};
 use crate::system::drm::Vendor;
+
+/// Optionale Audio-Konfiguration für [`VideoEncoder::create_with_audio`].
+#[derive(Debug, Clone)]
+pub struct AudioParams {
+    pub sample_rate: u32,
+    pub bitrate_kbps: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -46,6 +55,23 @@ impl VideoEncoder {
     /// `write_header` wird hier gerufen; danach geht jeder `write_interleaved`
     /// asynchron über den MuxWriter-Thread.
     pub fn create(cfg: &EncoderConfig, hw: &HwContext, output_path: &str) -> Result<Self> {
+        let (enc, _no_audio) = Self::create_with_audio(cfg, hw, output_path, None)?;
+        Ok(enc)
+    }
+
+    /// Wie [`create`], aber mit optionalem Audio-Stream (libopus). Der
+    /// Audio-Stream wird VOR `write_header` hinzugefügt; der zurückgegebene
+    /// [`AudioEncoder`] läuft auf einem eigenen Thread und teilt sich den Muxer
+    /// über [`VideoEncoder::mux_sender`]. Return: (Video-Encoder, ggf.
+    /// Audio-Encoder mit gesetzter Stream-Timebase).
+    ///
+    /// [`create`]: VideoEncoder::create
+    pub fn create_with_audio(
+        cfg: &EncoderConfig,
+        hw: &HwContext,
+        output_path: &str,
+        audio: Option<AudioParams>,
+    ) -> Result<(Self, Option<AudioEncoder>)> {
         ffmpeg::init().context("ffmpeg::init")?;
 
         let mut output = match url_format_hint(output_path) {
@@ -107,20 +133,44 @@ impl VideoEncoder {
             .with_context(|| format!("open hw encoder '{codec_name}' (vendor={:?})", cfg.vendor))?;
         stream.set_parameters(&opened);
 
+        // Audio-Stream VOR write_header hinzufügen (der Video-Stream-Borrow ist
+        // nach set_parameters freigegeben).
+        let mut audio_enc = match &audio {
+            Some(a) => Some(
+                AudioEncoder::create(&mut output, a.sample_rate, a.bitrate_kbps)
+                    .context("create audio encoder")?,
+            ),
+            None => None,
+        };
+
         output.write_header().context("write_header")?;
 
         let stream_time_base = output.stream(stream_idx).unwrap().time_base();
         let encoder_time_base = Rational::new(1, cfg.fps as i32);
 
+        // Vom Muxer zugewiesene Audio-Stream-Timebase nachreichen.
+        if let Some(ae) = audio_enc.as_mut() {
+            let tb = output.stream(ae.stream_idx()).unwrap().time_base();
+            ae.set_stream_time_base(tb);
+        }
+
         let mux = MuxWriter::start(output).context("start mux-writer")?;
 
-        Ok(Self {
-            mux,
-            encoder: opened,
-            video_stream_idx: stream_idx,
-            encoder_time_base,
-            stream_time_base,
-        })
+        Ok((
+            Self {
+                mux,
+                encoder: opened,
+                video_stream_idx: stream_idx,
+                encoder_time_base,
+                stream_time_base,
+            },
+            audio_enc,
+        ))
+    }
+
+    /// Cloneable Muxer-Sender für den Audio-Encode-Thread.
+    pub fn mux_sender(&self) -> Result<MuxSender> {
+        self.mux.sender()
     }
 
     /// Schicke einen HW-Frame (CUDA/VAAPI, `*mut AVFrame`) in den Encoder.

@@ -102,8 +102,19 @@ AMD/Intel geben klaren Fehler. Bekannt: `stop` während offenem Portal-Dialog bl
 zur Auswahl. Die FLV-"Failed to update header"-Warnings beim Stop sind harmlos (Live-RTMP
 kann den Header nicht nachschreiben).
 
-**Als Nächstes:** Audio (PipeWire-Audio-Node + Opus + 2-Stream-FLV); VAAPI-Import
-(`av_hwframe_map` DRM_PRIME, per Analogie, hier nicht testbar); `test_driver`-Example.
+**Audio steht** (`src/capture/audio.rs` + `src/encode/audio.rs`): PipeWire-Sink-Monitor
+(`STREAM_CAPTURE_SINK`, kein Portal nötig) → F32-Stereo-48k → libopus (Opus-in-FLV ist ab
+FFmpeg ≥6.1 nativ, kein Patch) → 2-Stream-FLV. `MuxWriter::sender()` liefert einen
+cloneable `MuxSender`; Audio läuft auf eigenem Encode-Thread, Muxer interleaved nach DTS.
+`VideoEncoder::create_with_audio` fügt den Audio-Stream VOR `write_header` ein. Teardown:
+Audio ZUERST stoppen (MuxSender droppt → Trailer kann schreiben), dann `enc.finish()`.
+Live verifiziert: `start` mit `audio.mode!="Aus"`, MediaMTX-API zeigt `tracks
+['H264','Opus']`. (ffmpegs klassischer RTMP-*Reader* zeigt nur Video — Opus-over-E-RTMP
+parst er nicht; MediaMTX als echter Konsument sieht beide.) A/V-Anchoring noch offen
+(`av_offset_ms` wird geloggt, nicht angewandt; Audio-pts startet bei 0 wie Video).
+
+**Als Nächstes:** VAAPI-Import (`av_hwframe_map` DRM_PRIME, per Analogie, hier nicht
+testbar); `test_driver`-Example.
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`

@@ -29,6 +29,23 @@ struct SendOutput(format::context::Output);
 // SAFETY: see above.
 unsafe impl Send for SendOutput {}
 
+/// Cloneable handle for pushing packets to the muxer from multiple producer
+/// threads (video pacing loop + audio encode thread). All packets land in the
+/// same bounded queue and are interleaved by the writer thread via
+/// `write_interleaved` (DTS order).
+#[derive(Clone)]
+pub struct MuxSender(SyncSender<SendPacket>);
+
+impl MuxSender {
+    /// Push a finished packet (stream index set, timestamps rescaled to the
+    /// stream timebase). Blocks only when the queue is full (= writer stuck).
+    pub fn send(&self, packet: Packet) -> Result<()> {
+        self.0
+            .send(SendPacket(packet))
+            .map_err(|_| anyhow!("mux-writer thread is gone"))
+    }
+}
+
 pub struct MuxWriter {
     tx: Option<SyncSender<SendPacket>>,
     worker: Option<JoinHandle<Result<()>>>,
@@ -75,6 +92,16 @@ impl MuxWriter {
             Some(tx) => tx
                 .send(SendPacket(packet))
                 .map_err(|_| anyhow!("mux-writer thread is gone")),
+            None => Err(anyhow!("mux-writer already finished")),
+        }
+    }
+
+    /// A cloneable sender for a second producer thread (audio). The trailer is
+    /// only written once ALL senders (this + every clone) have dropped, so the
+    /// audio side must drop its `MuxSender` before `finish()` can complete.
+    pub fn sender(&self) -> Result<MuxSender> {
+        match &self.tx {
+            Some(tx) => Ok(MuxSender(tx.clone())),
             None => Err(anyhow!("mux-writer already finished")),
         }
     }

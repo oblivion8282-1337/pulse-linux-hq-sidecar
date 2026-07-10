@@ -6,6 +6,7 @@
 //! (DMABUF-Frames) — ersetzt die synthetische Quelle durch echtes Screen-Capture
 //! mit Zero-Copy-DMABUF-Handoff in den Encoder.
 
+pub mod audio;
 pub mod egl_modifiers;
 pub mod portal;
 pub mod pipewire_stream;
