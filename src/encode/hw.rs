@@ -131,6 +131,13 @@ impl HwContext {
         self.frames_ref
     }
 
+    /// Der HW-Device-Kontext (`AVHWDeviceContext`-`AVBufferRef`). Der
+    /// VAAPI-Importer leitet daraus per `av_hwdevice_ctx_create_derived` ein
+    /// DRM-Device ab (gemeinsame Render-Node).
+    pub fn dev_ref(&self) -> *mut AVBufferRef {
+        self.dev_ref
+    }
+
     pub fn kind(&self) -> HwDeviceKind {
         self.kind
     }

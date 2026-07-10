@@ -113,8 +113,19 @@ Live verifiziert: `start` mit `audio.mode!="Aus"`, MediaMTX-API zeigt `tracks
 parst er nicht; MediaMTX als echter Konsument sieht beide.) A/V-Anchoring noch offen
 (`av_offset_ms` wird geloggt, nicht angewandt; Audio-pts startet bei 0 wie Video).
 
-**Als Nächstes:** VAAPI-Import (`av_hwframe_map` DRM_PRIME, per Analogie, hier nicht
-testbar); `test_driver`-Example.
+**VAAPI-Import implementiert (AMD/Intel) — NICHT auf Hardware getestet** (`src/encode/
+va_import.rs`): DMABUF → `AV_PIX_FMT_DRM_PRIME`-Frame (aus `AVDRMFrameDescriptor`) →
+Filtergraph `buffer → hwmap=derive_device=vaapi → scale_vaapi=format=nv12 → buffersink`.
+`hwmap` importiert das DMABUF zero-copy in eine VAAPI-Surface, `scale_vaapi` (VPP) macht
+BGRx→NV12 auf der GPU. Der Encoder bindet den NV12-Buffersink-Frames-Kontext. Nötig:
+ffmpeg-next-Feature `filter`. `VideoEncoder::create_with_audio` nimmt jetzt
+`(hw_pixel, frames_ctx)` statt `&HwContext` (entkoppelt NVENC/VAAPI). `run_stream`
+verzweigt über ein `FrameImporter`-Enum (Nvenc/Vaapi). Bruchstellen mit `// UNVERIFIED`
+markiert (DRM-hwframe-init, Deskriptor-`size`, hwmap-derive). NVIDIA-Regression nach dem
+Umbau OK (tracks H264+Opus, 60 fps, bytes steigen).
+
+**Als Nächstes:** `test_driver`-Example; A/V-Anchoring (`av_offset_ms` real anwenden);
+VAAPI auf echter AMD/Intel-Hardware verifizieren.
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`

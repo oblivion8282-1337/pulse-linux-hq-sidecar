@@ -14,6 +14,7 @@ pub mod hw;
 pub mod mux_writer;
 pub mod nv_import;
 pub mod opts;
+pub mod va_import;
 
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_next as ffmpeg;
@@ -55,20 +56,27 @@ impl VideoEncoder {
     /// `write_header` wird hier gerufen; danach geht jeder `write_interleaved`
     /// asynchron über den MuxWriter-Thread.
     pub fn create(cfg: &EncoderConfig, hw: &HwContext, output_path: &str) -> Result<Self> {
-        let (enc, _no_audio) = Self::create_with_audio(cfg, hw, output_path, None)?;
+        let (enc, _no_audio) =
+            Self::create_with_audio(cfg, hw.ffmpeg_pixel(), hw.frames_ref(), output_path, None)?;
         Ok(enc)
     }
 
-    /// Wie [`create`], aber mit optionalem Audio-Stream (libopus). Der
-    /// Audio-Stream wird VOR `write_header` hinzugefügt; der zurückgegebene
-    /// [`AudioEncoder`] läuft auf einem eigenen Thread und teilt sich den Muxer
-    /// über [`VideoEncoder::mux_sender`]. Return: (Video-Encoder, ggf.
-    /// Audio-Encoder mit gesetzter Stream-Timebase).
+    /// Wie [`create`], aber vom [`HwContext`] entkoppelt (nimmt HW-Pixelformat +
+    /// den zu bindenden Frames-Kontext direkt) und mit optionalem Audio-Stream
+    /// (libopus). Der NVENC-Pfad übergibt `hw.ffmpeg_pixel()`+`hw.frames_ref()`;
+    /// der VAAPI-Pfad übergibt `Pixel::VAAPI` + den NV12-Frames-Kontext vom
+    /// `scale_vaapi`-Filter-Ausgang. Der Audio-Stream wird VOR `write_header`
+    /// hinzugefügt; der zurückgegebene [`AudioEncoder`] läuft auf einem eigenen
+    /// Thread und teilt sich den Muxer über [`VideoEncoder::mux_sender`].
+    ///
+    /// SAFETY: `frames_ctx` muss ein gültiger `AVHWFramesContext`-`AVBufferRef`
+    /// sein, der `hw_pixel` entspricht, und mindestens bis `write_header` leben.
     ///
     /// [`create`]: VideoEncoder::create
     pub fn create_with_audio(
         cfg: &EncoderConfig,
-        hw: &HwContext,
+        hw_pixel: format::Pixel,
+        frames_ctx: *mut AVBufferRef,
         output_path: &str,
         audio: Option<AudioParams>,
     ) -> Result<(Self, Option<AudioEncoder>)> {
@@ -103,7 +111,7 @@ impl VideoEncoder {
             .video()?;
         encoder.set_width(cfg.width);
         encoder.set_height(cfg.height);
-        encoder.set_format(hw.ffmpeg_pixel());
+        encoder.set_format(hw_pixel);
         encoder.set_time_base(Rational::new(1, cfg.fps as i32));
         encoder.set_frame_rate(Some(Rational::new(cfg.fps as i32, 1)));
         encoder.set_bit_rate((cfg.bitrate_kbps as usize).saturating_mul(1000));
@@ -120,9 +128,9 @@ impl VideoEncoder {
         // Frames-Pool als Input-Quelle.
         unsafe {
             let ctx_ptr = encoder.as_mut_ptr();
-            let new_ref = av_buffer_ref(hw.frames_ref());
+            let new_ref = av_buffer_ref(frames_ctx);
             if new_ref.is_null() {
-                return Err(anyhow!("av_buffer_ref(hw_frames_ref) returned NULL"));
+                return Err(anyhow!("av_buffer_ref(frames_ctx) returned NULL"));
             }
             (*ctx_ptr).hw_frames_ctx = new_ref;
         }

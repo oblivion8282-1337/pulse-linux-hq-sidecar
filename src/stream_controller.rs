@@ -25,10 +25,40 @@ use crate::capture::portal;
 use crate::encode::audio::AudioEncoder;
 use crate::encode::mux_writer::MuxSender;
 use crate::encode::nv_import::NvDmabufImporter;
+use crate::encode::va_import::VaapiImporter;
 use crate::encode::{AudioParams, EncoderConfig, VideoEncoder, hw};
 use crate::events;
 use crate::proto::{Event, StreamState};
 use crate::system::drm::{self, Vendor};
+
+/// Vendor-spezifischer Zero-Copy-Importer + der Frames-Kontext, den der Encoder
+/// binden muss. NVENC: EGL/CUDA-Interop, Encoder bindet den BGR0-Pool.
+/// VAAPI (AMD/Intel): DRM_PRIME→scale_vaapi-Filtergraph, Encoder bindet den
+/// NV12-Buffersink-Ausgang.
+enum FrameImporter {
+    Nvenc { imp: NvDmabufImporter, hw: hw::HwContext },
+    Vaapi { imp: VaapiImporter },
+}
+
+impl FrameImporter {
+    /// HW-Pixelformat + Frames-Kontext für `VideoEncoder::create_with_audio`.
+    fn encoder_binding(&self) -> (ffmpeg::format::Pixel, *mut ffmpeg::ffi::AVBufferRef) {
+        match self {
+            FrameImporter::Nvenc { hw, .. } => (hw.ffmpeg_pixel(), hw.frames_ref()),
+            FrameImporter::Vaapi { imp } => {
+                (ffmpeg::format::Pixel::VAAPI, imp.output_frames_ctx())
+            }
+        }
+    }
+
+    /// Importiere einen DMABUF-Frame → encoder-fertiges HW-`AVFrame`.
+    fn import(&mut self, frame: &DmabufFrame) -> Result<*mut ffmpeg::ffi::AVFrame> {
+        match self {
+            FrameImporter::Nvenc { imp, hw } => imp.import(frame, hw),
+            FrameImporter::Vaapi { imp } => imp.import(frame),
+        }
+    }
+}
 
 /// Standard-Audio-Bitrate (Opus), bis Profile eine eigene mitliefern.
 const AUDIO_BITRATE_KBPS: u32 = 128;
@@ -217,17 +247,8 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         uptime_s: 0.0,
     });
 
-    let (vendor, _render_node) =
+    let (vendor, render_node) =
         drm::detect().ok_or_else(|| anyhow!("keine DRM-Render-Node gefunden"))?;
-
-    // v1: Der Zero-Copy-Capture-Pfad ist NVENC (EGL/CUDA-Interop). Der
-    // VAAPI-DMABUF-Import (AMD/Intel) folgt separat — bis dahin ein klarer
-    // Fehler statt eines Absturzes.
-    if !matches!(vendor, Vendor::Nvidia) {
-        return Err(anyhow!(
-            "Screen-Capture ist v1 nur für NVIDIA/NVENC verdrahtet — der VAAPI-DMABUF-Import (AMD/Intel) ist noch nicht fertig"
-        ));
-    }
 
     // 1) Portal-Dialog: User wählt Monitor/Fenster. Blockt bis zur Auswahl.
     emit(Event::Log {
@@ -269,14 +290,31 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         });
     }
 
-    // 4) HW-Context (sw_format BGR0 für den Zero-Copy-Import), Encoder, Importer.
-    let hw_ctx = hw::HwContext::create(
-        hw::HwDeviceKind::Cuda,
-        None,
-        width,
-        height,
-        ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
-    )?;
+    // 4) Vendor-spezifischen Importer bauen. NVENC: BGR0-HW-Pool + CUDA-Interop.
+    //    VAAPI: DRM_PRIME→scale_vaapi-Filtergraph (NV12-Ausgang).
+    let mut importer = match vendor {
+        Vendor::Nvidia => {
+            let hw_ctx = hw::HwContext::create(
+                hw::HwDeviceKind::Cuda,
+                None,
+                width,
+                height,
+                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
+            )?;
+            let imp = NvDmabufImporter::new()?;
+            FrameImporter::Nvenc { imp, hw: hw_ctx }
+        }
+        Vendor::Amd | Vendor::Intel => {
+            emit(Event::Log {
+                line: "[stream] VAAPI-Capture-Pfad (AMD/Intel) — auf dieser Hardware nicht getestet".to_string(),
+            });
+            let imp = VaapiImporter::new(&render_node, first.drm_fourcc, width, height, params.fps)?;
+            FrameImporter::Vaapi { imp }
+        }
+    };
+
+    // 5) Encoder mit dem vom Importer vorgegebenen HW-Pixel + Frames-Kontext.
+    let (hw_pixel, frames_ctx) = importer.encoder_binding();
     let cfg = EncoderConfig {
         vendor,
         codec: params.codec.clone(),
@@ -290,8 +328,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         bitrate_kbps: AUDIO_BITRATE_KBPS,
     });
     let (mut enc, audio_enc) =
-        VideoEncoder::create_with_audio(&cfg, &hw_ctx, &params.push_url, audio_params)?;
-    let mut importer = NvDmabufImporter::new()?;
+        VideoEncoder::create_with_audio(&cfg, hw_pixel, frames_ctx, &params.push_url, audio_params)?;
 
     if params.av_offset_ms != 0 {
         emit(Event::Log {
@@ -317,8 +354,8 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         None => None,
     };
 
-    // 5) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
-    let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first, &hw_ctx)?;
+    // 6) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
+    let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first)?;
     close_planes(&first);
 
     shared.live.store(true, Ordering::SeqCst);
@@ -358,7 +395,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
                 }
             }
             if let Some(frame) = newest {
-                match importer.import(&frame, &hw_ctx) {
+                match importer.import(&frame) {
                     Ok(hw) => {
                         unsafe { ffmpeg::ffi::av_frame_free(&mut last_hw) };
                         last_hw = hw;

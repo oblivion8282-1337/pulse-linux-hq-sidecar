@@ -22,6 +22,7 @@ anyhow = "1"
 ffmpeg-next = { version = "8.1", default-features = false, features = [
     "codec",
     "format",
+    "filter",              # scale_vaapi (BGRx→NV12 CSC) für den VAAPI-Import
     "software-resampling",
     "software-scaling",
 ] }
