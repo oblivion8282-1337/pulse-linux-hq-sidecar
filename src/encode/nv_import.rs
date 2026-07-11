@@ -33,6 +33,7 @@
 //! Importer auf DEM Thread erzeugen und benutzen, der encodiert. Bewusst
 //! nicht `Send`.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 
@@ -171,6 +172,15 @@ struct Staging {
     cu_res: CuGraphicsResource,
 }
 
+/// Pro PipeWire-Buffer gecachtes EGLImage + daran gebundene GL-Textur — der
+/// Compositor reicht dieselben 2–8 Buffer im Kreis, Neuanlegen pro Frame wäre
+/// Wegwerf-Arbeit. Key = `DmabufFrame::buffer_key`, Invalidierung über
+/// `DmabufFrame::epoch`.
+struct CachedImage {
+    image: EglImage,
+    tex: u32,
+}
+
 /// DMABUF→CUDA-Importer. Hält EGL-Display+Context (current auf dem
 /// erzeugenden Thread) und den retained CUDA-Primary-Context.
 pub struct NvDmabufImporter {
@@ -210,6 +220,9 @@ pub struct NvDmabufImporter {
     fbos: [u32; 2],
     out_w: u32,
     out_h: u32,
+    /// EGLImage+Textur pro Capture-Buffer (s. [`CachedImage`]).
+    image_cache: HashMap<u64, CachedImage>,
+    cache_epoch: u64,
 
     cu_device: i32,
     cu_ctx: CuContext,
@@ -428,6 +441,8 @@ impl NvDmabufImporter {
                 fbos: [0; 2],
                 out_w,
                 out_h,
+                image_cache: HashMap::new(),
+                cache_epoch: 0,
                 cu_device,
                 cu_ctx,
                 cu_primary_ctx_release,
@@ -526,11 +541,50 @@ impl NvDmabufImporter {
         }
     }
 
-    fn copy_into(&self, frame: &DmabufFrame, dst: *mut AVFrame) -> Result<()> {
+    fn copy_into(&mut self, frame: &DmabufFrame, dst: *mut AVFrame) -> Result<()> {
         if frame.planes.is_empty() || frame.planes.len() > 4 {
             return Err(anyhow!("DmabufFrame mit {} Planes", frame.planes.len()));
         }
 
+        // Epochenwechsel (Buffer-Abbau/Neuverhandlung in der Capture) →
+        // gecachte EGLImages zeigen evtl. auf tote/recycelte Buffer: alles weg.
+        if frame.epoch != self.cache_epoch {
+            self.drop_image_cache();
+            self.cache_epoch = frame.epoch;
+        }
+        // Notbremse gegen pathologisches Key-Churn (normal sind 2–8 Buffer).
+        if self.image_cache.len() > 32 {
+            tracing::warn!(target: "nvenc", "EGLImage-Cache >32 Einträge — leere (Key-Churn?)");
+            self.drop_image_cache();
+        }
+
+        // Der Compositor reicht dieselben Buffer im Kreis: EGLImage + GL-Textur
+        // EINMAL pro Buffer bauen und wiederverwenden — statt Anlegen+Zerstören
+        // bei jedem Frame (bei 144+fps reine Wegwerf-Arbeit). EGL hält eine
+        // eigene dma-buf-Referenz (EGL_EXT_image_dma_buf_import), das Image
+        // bleibt also auch nach dem Schließen der dup'ten fds gültig und ist
+        // eine LIVE-Sicht auf den Buffer-Inhalt.
+        let tex = match self.image_cache.get(&frame.buffer_key) {
+            Some(cached) => cached.tex,
+            None => {
+                let (image, tex) = self.create_image_tex(frame)?;
+                self.image_cache.insert(frame.buffer_key, CachedImage { image, tex });
+                // Taucht nur beim ersten Umlauf jedes Buffers auf (2–8×  pro
+                // Stream) — steigt die Zahl dauerhaft, ist das Caching kaputt.
+                tracing::info!(
+                    target: "nvenc",
+                    buffers = self.image_cache.len(),
+                    "EGLImage-Cache: neuer Capture-Buffer aufgenommen"
+                );
+                tex
+            }
+        };
+        unsafe { self.blit_and_copy(tex, frame, dst) }
+    }
+
+    /// EGLImage aus den DMABUF-Planes + daran gebundene GL-Textur (einmal pro
+    /// Buffer; landet im `image_cache`).
+    fn create_image_tex(&self, frame: &DmabufFrame) -> Result<(EglImage, u32)> {
         unsafe {
             // EGLImage aus den DMABUF-Planes (+ Modifier, außer INVALID).
             let mut attribs: Vec<i32> = vec![
@@ -574,17 +628,7 @@ impl NvDmabufImporter {
                     (self.egl_get_error)()
                 ));
             }
-            // Ab hier: image freigeben bei jedem Ausstieg.
-            let result = self.copy_image(image, frame, dst);
-            (self.egl_destroy_image)(self.dpy, image);
-            result
-        }
-    }
 
-    unsafe fn copy_image(&self, image: EglImage, frame: &DmabufFrame, dst: *mut AVFrame) -> Result<()> {
-        let staging = self.staging.as_ref().expect("ensure_staging vor copy_image");
-        unsafe {
-            // GL-Textur aus dem EGLImage (pro Frame — die fds wechseln).
             let mut tex: u32 = 0;
             (self.gl_gen_textures)(1, &mut tex);
             (self.gl_bind_texture)(GL_TEXTURE_2D, tex);
@@ -592,18 +636,24 @@ impl NvDmabufImporter {
             (self.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             (self.gl_image_target_texture)(GL_TEXTURE_2D, image);
             let gl_err = (self.gl_get_error)();
+            (self.gl_bind_texture)(GL_TEXTURE_2D, 0);
             if gl_err != GL_NO_ERROR {
-                (self.gl_bind_texture)(GL_TEXTURE_2D, 0);
                 (self.gl_delete_textures)(1, &tex);
+                (self.egl_destroy_image)(self.dpy, image);
                 return Err(anyhow!(
                     "glEGLImageTargetTexture2DOES failed (glError={gl_err:#06x})"
                 ));
             }
-            (self.gl_bind_texture)(GL_TEXTURE_2D, 0);
+            Ok((image, tex))
+        }
+    }
 
+    unsafe fn blit_and_copy(&self, tex: u32, frame: &DmabufFrame, dst: *mut AVFrame) -> Result<()> {
+        let staging = self.staging.as_ref().expect("ensure_staging vor blit_and_copy");
+        unsafe {
             // EGLImage-Textur → Staging, IMMER per Framebuffer-Blit (LINEAR):
             // skaliert bei Bedarf und ist bei 1:1 ein reiner Copy. Bewusst KEIN
-            // glCopyImageSubData-Schnellpfad mehr — der kopiert ROHE Bytes
+            // glCopyImageSubData-Schnellpfad — der kopiert ROHE Bytes
             // (BGRx bliebe BGRx), der Blit dagegen KOMPONENTENWEISE: der
             // Treiber liest die BGRA-geordnete Quelle logisch korrekt und
             // schreibt in die RGBA8-Staging → Bytes liegen danach als R,G,B,X.
@@ -625,8 +675,8 @@ impl NvDmabufImporter {
                 0, 0, staging.width as i32, staging.height as i32,
                 GL_COLOR_BUFFER_BIT, GL_LINEAR,
             );
-            // Texturen detachen, bevor `tex` gelöscht wird (dangling
-            // Attachment) — und den FBO-Bind zurücksetzen.
+            // Texturen detachen (die Quell-Textur lebt im Cache weiter, soll
+            // aber nicht am FBO hängen bleiben) — und den FBO-Bind zurücksetzen.
             (self.gl_framebuffer_texture_2d)(
                 GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
             );
@@ -635,12 +685,21 @@ impl NvDmabufImporter {
             );
             (self.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
             let gl_err = (self.gl_get_error)();
-            (self.gl_delete_textures)(1, &tex);
             if gl_err != GL_NO_ERROR {
-                return Err(anyhow!("GL copy/blit → staging failed (glError={gl_err:#06x})"));
+                return Err(anyhow!("GL blit → staging failed (glError={gl_err:#06x})"));
             }
 
             self.cuda_copy(staging.cu_res, dst)
+        }
+    }
+
+    /// Alle gecachten EGLImages + Texturen zerstören (Epochenwechsel / Drop).
+    fn drop_image_cache(&mut self) {
+        for (_, c) in self.image_cache.drain() {
+            unsafe {
+                (self.gl_delete_textures)(1, &c.tex);
+                (self.egl_destroy_image)(self.dpy, c.image);
+            }
         }
     }
 
@@ -714,6 +773,7 @@ impl NvDmabufImporter {
 
 impl Drop for NvDmabufImporter {
     fn drop(&mut self) {
+        self.drop_image_cache();
         self.drop_staging();
         unsafe {
             if self.fbos != [0; 2] {

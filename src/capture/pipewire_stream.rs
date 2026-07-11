@@ -60,6 +60,16 @@ pub struct DmabufFrame {
     /// DRM-Format-Modifier des Buffers (für av_hwframe_map / CUDA-Import).
     pub modifier: u64,
     pub pts: u64,
+    /// Stabile Identität des zugrundeliegenden PipeWire-Buffers (Hash über die
+    /// ORIGINAL-fds + Offsets, vor dem dup). Der Compositor reicht dieselben
+    /// 2–8 Buffer im Kreis — der NVENC-Importer cachet EGLImage+GL-Textur pro
+    /// Buffer statt sie pro Frame neu zu bauen. 0 = kein Key (nicht cachen).
+    pub buffer_key: u64,
+    /// Buffer-Generation: hochgezählt bei jedem `remove_buffer` und jeder
+    /// Format-Neuverhandlung. Wechselt die Epoche, wirft der Importer seinen
+    /// Cache komplett weg — schützt vor fd-Nummern-Recycling (gleiche Nummer,
+    /// anderer Buffer).
+    pub epoch: u64,
 }
 
 /// User-Daten für die Stream-Listener (auf dem Worker-Thread).
@@ -76,6 +86,25 @@ struct StreamData {
     /// endlos zu re-announcen).
     announced_modifier: Option<i64>,
     shm_warned: bool,
+    /// Buffer-Generation für den Importer-Cache (s. `DmabufFrame::epoch`).
+    epoch: u64,
+}
+
+/// FNV-1a über die Original-fds + Offsets eines Buffers — stabiler Cache-Key,
+/// solange der Buffer lebt (fd-Nummern sind prozessweit eindeutig, solange
+/// offen; Recycling nach Buffer-Abbau fängt die `epoch` ab).
+fn buffer_key_of(planes: impl Iterator<Item = (i32, u32)>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for (fd, offset) in planes {
+        mix(fd as u64);
+        mix(offset as u64);
+    }
+    // 0 ist als "kein Key" reserviert.
+    if h == 0 { 1 } else { h }
 }
 
 /// PipeWire-Capture-Session. `stop` beendet den Worker-Thread.
@@ -296,6 +325,7 @@ fn run_pipewire(
         enum_format_bytes: enum_format_bytes.clone(),
         announced_modifier: None,
         shm_warned: false,
+        epoch: 0,
     };
 
     let stream = pw::stream::StreamRc::new(
@@ -379,6 +409,8 @@ fn run_pipewire(
             };
 
             // Fixiertes Format: echte Größe/Format/Modifier übernehmen.
+            // Neuverhandlung = neue Buffer → Importer-Cache-Epoche wechseln.
+            ud.epoch += 1;
             let mut info = VideoInfoRaw::new();
             if info.parse(param).is_err() {
                 tracing::warn!(target: "pipewire", "Format-Parse fehlgeschlagen");
@@ -413,6 +445,12 @@ fn run_pipewire(
                 let _ = s.update_params(&mut params);
             }
         })
+        .remove_buffer(|_s, ud, _buf| {
+            // Buffer wird abgebaut → seine fd-Nummern können recycelt werden.
+            // Epoche wechseln, damit der Importer-Cache nicht auf einen
+            // NEUEN Buffer mit ALTER fd-Nummer zeigt.
+            ud.epoch += 1;
+        })
         .process(|s, ud| {
             let Some(mut buffer) = s.dequeue_buffer() else { return };
             let datas = buffer.datas_mut();
@@ -432,6 +470,10 @@ fn run_pipewire(
                 }
                 return;
             }
+            // Cache-Key aus den ORIGINAL-fds (stabil pro Buffer) — vor dem dup.
+            let buffer_key = buffer_key_of(
+                datas.iter().filter(|d| d.fd() >= 0).map(|d| (d.fd(), d.chunk().offset())),
+            );
             let mut planes = Vec::with_capacity(datas.len());
             for d in datas.iter() {
                 let fd = d.fd();
@@ -459,6 +501,8 @@ fn run_pipewire(
                     drm_fourcc: ud.drm_fourcc,
                     modifier: ud.modifier,
                     pts: 0, // PTS vom Capture-Clock — folgt mit A/V-Sync.
+                    buffer_key,
+                    epoch: ud.epoch,
                 });
             }
             // buffer wird beim Drop zurückgequeue'd.
