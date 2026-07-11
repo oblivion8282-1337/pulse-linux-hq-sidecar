@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
         None,
         w,
         h,
-        AVPixelFormat::AV_PIX_FMT_BGR0,
+        AVPixelFormat::AV_PIX_FMT_RGB0,
     )?;
     let cfg = EncoderConfig {
         vendor,

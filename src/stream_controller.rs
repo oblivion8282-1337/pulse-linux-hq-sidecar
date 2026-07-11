@@ -451,12 +451,14 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     //    VAAPI: DRM_PRIME→scale_vaapi-Filtergraph (NV12-Ausgang).
     let mut importer = match vendor {
         Vendor::Nvidia => {
+            // RGB0 (nicht BGR0): der GL-Blit im Importer kopiert komponenten-
+            // weise BGRx→RGBA8, die Staging-Bytes liegen danach als R,G,B,X.
             let hw_ctx = hw::HwContext::create(
                 hw::HwDeviceKind::Cuda,
                 None,
                 out_w,
                 out_h,
-                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
+                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGB0,
             )?;
             let imp = NvDmabufImporter::new(out_w, out_h)?;
             FrameImporter::Nvenc { imp, hw: hw_ctx }

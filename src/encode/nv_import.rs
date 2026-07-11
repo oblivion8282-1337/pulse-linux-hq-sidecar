@@ -6,13 +6,17 @@
 //!
 //! DMABUF-fds → `eglCreateImageKHR` (EGL_LINUX_DMA_BUF_EXT + Modifier)
 //!   → GL-Textur (`glEGLImageTargetTexture2DOES`)
-//!   → `glCopyImageSubData` in eine EIGENE RGBA8-Staging-Textur — CUDA kann
-//!     EGLImage-gebundene Texturen nicht registrieren (INVALID_VALUE), GSR
-//!     kopiert deshalb ebenfalls erst in eigene Texturen
+//!   → `glBlitFramebuffer` (LINEAR) in eine EIGENE RGBA8-Staging-Textur in
+//!     AUSGABE-Größe — skaliert dabei, wenn Capture ≠ Ziel; CUDA kann
+//!     EGLImage-gebundene Texturen ohnehin nicht registrieren (INVALID_VALUE),
+//!     GSR kopiert deshalb ebenfalls erst in eigene Texturen. Der Blit ist
+//!     KOMPONENTENWEISE (nicht byte-roh): BGRx-Quelle → RGBA8-Staging heißt,
+//!     die Bytes liegen danach als R,G,B,X.
 //!   → `cuGraphicsGLRegisterImage` (einmalig, auf der Staging-Textur) /
 //!     `cuGraphicsSubResourceGetMappedArray`
 //!   → `cuMemcpy2D` (ARRAY→DEVICE) in den linearen ffmpeg-CUDA-Frame
-//!     (sw_format BGR0 — NVENC nimmt RGB direkt, keine CPU-Kopie nötig).
+//!     (sw_format RGB0, passend zur Blit-Byte-Ordnung — NVENC nimmt RGB
+//!     direkt, keine CPU-Kopie nötig).
 //!
 //! Der GPU-seitige Copy detiled dabei Block-Linear→Linear; ein CPU-Roundtrip
 //! findet nie statt. Voraussetzung: FFmpegs CUDA-Device nutzt den
@@ -130,12 +134,6 @@ type FnGlGetError = unsafe extern "C" fn() -> u32;
 type FnGlGetString = unsafe extern "C" fn(u32) -> *const c_char;
 type FnGlTexStorage2D = unsafe extern "C" fn(u32, i32, u32, i32, i32);
 type FnGlTexParameteri = unsafe extern "C" fn(u32, u32, i32);
-#[allow(clippy::type_complexity)]
-type FnGlCopyImageSubData = unsafe extern "C" fn(
-    u32, u32, i32, i32, i32, i32, // src: name, target, level, x, y, z
-    u32, u32, i32, i32, i32, i32, // dst: name, target, level, x, y, z
-    i32, i32, i32, // width, height, depth
-);
 type FnGlGenFramebuffers = unsafe extern "C" fn(i32, *mut u32);
 type FnGlDeleteFramebuffers = unsafe extern "C" fn(i32, *const u32);
 type FnGlBindFramebuffer = unsafe extern "C" fn(u32, u32);
@@ -197,7 +195,6 @@ pub struct NvDmabufImporter {
     gl_get_error: FnGlGetError,
     gl_tex_storage_2d: FnGlTexStorage2D,
     gl_tex_parameteri: FnGlTexParameteri,
-    gl_copy_image_sub_data: FnGlCopyImageSubData,
     gl_gen_framebuffers: FnGlGenFramebuffers,
     gl_delete_framebuffers: FnGlDeleteFramebuffers,
     gl_bind_framebuffer: FnGlBindFramebuffer,
@@ -294,8 +291,6 @@ impl NvDmabufImporter {
             let gl_get_string = egl_proc!(get_proc, "glGetString", FnGlGetString);
             let gl_tex_storage_2d = egl_proc!(get_proc, "glTexStorage2D", FnGlTexStorage2D);
             let gl_tex_parameteri = egl_proc!(get_proc, "glTexParameteri", FnGlTexParameteri);
-            let gl_copy_image_sub_data =
-                egl_proc!(get_proc, "glCopyImageSubData", FnGlCopyImageSubData);
             let gl_gen_framebuffers =
                 egl_proc!(get_proc, "glGenFramebuffers", FnGlGenFramebuffers);
             let gl_delete_framebuffers =
@@ -424,7 +419,6 @@ impl NvDmabufImporter {
                 gl_get_error,
                 gl_tex_storage_2d,
                 gl_tex_parameteri,
-                gl_copy_image_sub_data,
                 gl_gen_framebuffers,
                 gl_delete_framebuffers,
                 gl_bind_framebuffer,
@@ -607,41 +601,39 @@ impl NvDmabufImporter {
             }
             (self.gl_bind_texture)(GL_TEXTURE_2D, 0);
 
-            // EGLImage-Textur → Staging. Gleiche Größe: Raw-Texel-Copy (Detile
-            // passiert im Treiber). Andere Größe: Framebuffer-Blit mit LINEAR-
-            // Filter = GPU-Downscale in einem Schritt. CUDA sieht danach die
-            // Staging-Textur; die Map-Operation synchronisiert implizit mit
-            // vorherigem GL.
-            if frame.width == staging.width && frame.height == staging.height {
-                (self.gl_copy_image_sub_data)(
-                    tex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                    staging.tex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                    staging.width as i32, staging.height as i32, 1,
-                );
-            } else {
-                (self.gl_bind_framebuffer)(GL_READ_FRAMEBUFFER, self.fbos[0]);
-                (self.gl_framebuffer_texture_2d)(
-                    GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0,
-                );
-                (self.gl_bind_framebuffer)(GL_DRAW_FRAMEBUFFER, self.fbos[1]);
-                (self.gl_framebuffer_texture_2d)(
-                    GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, staging.tex, 0,
-                );
-                (self.gl_blit_framebuffer)(
-                    0, 0, frame.width as i32, frame.height as i32,
-                    0, 0, staging.width as i32, staging.height as i32,
-                    GL_COLOR_BUFFER_BIT, GL_LINEAR,
-                );
-                // Texturen detachen, bevor `tex` gelöscht wird (dangling
-                // Attachment) — und den FBO-Bind zurücksetzen.
-                (self.gl_framebuffer_texture_2d)(
-                    GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
-                );
-                (self.gl_framebuffer_texture_2d)(
-                    GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
-                );
-                (self.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
-            }
+            // EGLImage-Textur → Staging, IMMER per Framebuffer-Blit (LINEAR):
+            // skaliert bei Bedarf und ist bei 1:1 ein reiner Copy. Bewusst KEIN
+            // glCopyImageSubData-Schnellpfad mehr — der kopiert ROHE Bytes
+            // (BGRx bliebe BGRx), der Blit dagegen KOMPONENTENWEISE: der
+            // Treiber liest die BGRA-geordnete Quelle logisch korrekt und
+            // schreibt in die RGBA8-Staging → Bytes liegen danach als R,G,B,X.
+            // Zwei Pfade hieße zwei Byte-Ordnungen je nach Skalierung (der
+            // Rot/Blau-Tausch-Bug). Deshalb: ein Pfad, und der Encoder-Pool
+            // ist RGB0 (stream_controller) — passt zum Blit-Ergebnis.
+            // CUDA sieht danach die Staging-Textur; die Map-Operation
+            // synchronisiert implizit mit vorherigem GL.
+            (self.gl_bind_framebuffer)(GL_READ_FRAMEBUFFER, self.fbos[0]);
+            (self.gl_framebuffer_texture_2d)(
+                GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0,
+            );
+            (self.gl_bind_framebuffer)(GL_DRAW_FRAMEBUFFER, self.fbos[1]);
+            (self.gl_framebuffer_texture_2d)(
+                GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, staging.tex, 0,
+            );
+            (self.gl_blit_framebuffer)(
+                0, 0, frame.width as i32, frame.height as i32,
+                0, 0, staging.width as i32, staging.height as i32,
+                GL_COLOR_BUFFER_BIT, GL_LINEAR,
+            );
+            // Texturen detachen, bevor `tex` gelöscht wird (dangling
+            // Attachment) — und den FBO-Bind zurücksetzen.
+            (self.gl_framebuffer_texture_2d)(
+                GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
+            );
+            (self.gl_framebuffer_texture_2d)(
+                GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
+            );
+            (self.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
             let gl_err = (self.gl_get_error)();
             (self.gl_delete_textures)(1, &tex);
             if gl_err != GL_NO_ERROR {
