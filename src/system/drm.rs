@@ -83,13 +83,50 @@ fn enumerate_render_nodes() -> Vec<Node> {
     nodes
 }
 
+/// String → Vendor für den `PULSE_HQ_VENDOR`-Override.
+fn parse_vendor(s: &str) -> Option<Vendor> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "nvidia" => Some(Vendor::Nvidia),
+        "amd" => Some(Vendor::Amd),
+        "intel" => Some(Vendor::Intel),
+        _ => None,
+    }
+}
+
 /// Detektiere den primären Vendor + dessen Render-Node-Pfad.
 ///
-/// Bevorzugt dGPU (nvidia/amd) vor Intel-iGPU. Liefert `None` wenn keine
-/// bekannte Render-Node gefunden wurde (→ Sidecar meldet `available=false`-ähnlich
-/// bzw. Encoder-Pfade schlagen sauber fehl).
+/// `PULSE_HQ_VENDOR=nvidia|amd|intel` erzwingt eine bestimmte Encode-GPU
+/// (Multi-GPU-Test: AMD-iGPU-VAAPI trotz NVIDIA-dGPU — Voraussetzung: die
+/// aufgenommene Quelle liegt AUF dieser GPU, sonst scheitert der Zero-Copy-
+/// Import). Ist der erzwungene Vendor nicht als Render-Node da → `None` (klarer
+/// Fehler statt stillem Fallback auf die falsche Karte).
+///
+/// Ohne Override: bevorzugt dGPU (nvidia/amd) vor Intel-iGPU. `None` wenn keine
+/// bekannte Render-Node gefunden wurde (→ Encoder-Pfade schlagen sauber fehl).
 pub fn detect() -> Option<(Vendor, String)> {
     let nodes = enumerate_render_nodes();
+
+    if let Ok(forced) = std::env::var("PULSE_HQ_VENDOR") {
+        let want = parse_vendor(&forced);
+        if want.is_none() {
+            tracing::warn!(target: "stream", "PULSE_HQ_VENDOR='{forced}' unbekannt — ignoriert");
+        }
+        if let Some(want) = want {
+            let node = nodes.iter().find(|n| n.vendor == want);
+            match node {
+                Some(n) => tracing::info!(
+                    target: "stream", vendor = want.slug(), node = %n.path.display(),
+                    "PULSE_HQ_VENDOR-Override aktiv"
+                ),
+                None => tracing::error!(
+                    target: "stream", vendor = want.slug(),
+                    "PULSE_HQ_VENDOR erzwingt Vendor, aber keine passende Render-Node vorhanden"
+                ),
+            }
+            return node.map(|n| (n.vendor, n.path.to_string_lossy().to_string()));
+        }
+    }
+
     // Bevorzuge dGPU.
     let pick = nodes
         .iter()
