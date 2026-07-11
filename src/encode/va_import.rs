@@ -48,8 +48,18 @@ pub struct VaapiImporter {
 
 impl VaapiImporter {
     /// `render_node`: `/dev/dri/renderDXXX`. `drm_fourcc`: DRM-Format der
-    /// Capture-Surface (XRGB8888 für BGRx). `width`/`height`: native Maße.
-    pub fn new(render_node: &str, drm_fourcc: u32, width: u32, height: u32, fps: u32) -> Result<Self> {
+    /// Capture-Surface (XRGB8888 für BGRx). `width`/`height`: native Maße der
+    /// Capture. `out_w`/`out_h`: Encoder-Zielgröße — weicht sie ab, skaliert
+    /// `scale_vaapi` (VPP) im selben Durchgang wie der BGRx→NV12-CSC.
+    pub fn new(
+        render_node: &str,
+        drm_fourcc: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        out_w: u32,
+        out_h: u32,
+    ) -> Result<Self> {
         unsafe {
             // 1) DRM-Device am Render-Node. Der Filter leitet daraus per
             //    hwmap=derive_device=vaapi die VAAPI-Device ab.
@@ -77,7 +87,7 @@ impl VaapiImporter {
                 height,
                 drm_fourcc,
             };
-            if let Err(e) = me.build_graph(fps) {
+            if let Err(e) = me.build_graph(fps, out_w, out_h) {
                 // me's Drop räumt drm_dev/graph auf.
                 return Err(e);
             }
@@ -85,7 +95,7 @@ impl VaapiImporter {
         }
     }
 
-    unsafe fn build_graph(&mut self, fps: u32) -> Result<()> {
+    unsafe fn build_graph(&mut self, fps: u32, out_w: u32, out_h: u32) -> Result<()> {
         unsafe {
             // 2) DRM-Frames-Kontext (Vorlage für die DRM_PRIME-Eingabe-Frames).
             //    UNVERIFIED: DRM-hwframe-init ist laut FFmpeg-Doku eingeschränkt
@@ -161,12 +171,15 @@ impl VaapiImporter {
                 return Err(anyhow!("init hwmap failed (rc={r})"));
             }
 
-            // scale_vaapi=format=nv12 (VPP-CSC BGRx → NV12 auf der GPU).
+            // scale_vaapi=w:h:format=nv12 (VPP: CSC BGRx→NV12 + Downscale in
+            // EINEM GPU-Durchgang — bei out==native skaliert er nicht).
             let scale_ctx = avfilter_graph_alloc_filter(graph, scale_vaapi, c"csc".as_ptr());
             if scale_ctx.is_null() {
                 return Err(anyhow!("alloc scale_vaapi failed"));
             }
-            let r = avfilter_init_str(scale_ctx, c"format=nv12".as_ptr());
+            let scale_args =
+                std::ffi::CString::new(format!("w={out_w}:h={out_h}:format=nv12")).unwrap();
+            let r = avfilter_init_str(scale_ctx, scale_args.as_ptr());
             if r < 0 {
                 return Err(anyhow!("init scale_vaapi failed (rc={r})"));
             }

@@ -54,6 +54,8 @@ libloading = "0.8"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# fat-LTO: der heiße Pfad (Frame-Drain → Import → Encode) läuft pro Frame bei
+# bis zu 1000fps — cross-crate-Inlining lohnt, Build-Zeit ist uns egal.
+lto = "fat"
 codegen-units = 1
 strip = true

@@ -144,8 +144,33 @@ Livestream). `av_offset_ms` ist jetzt funktionaler Feinabgleich (positiv = Ton s
 Verifiziert (RTSP-Aufnahme, Paket-PTS): beide Spuren enden nach 15 s auf **16 ms genau** →
 kein Drift. (`start_time`-Diff in Mid-Stream-Aufnahmen = Keyframe-Artefakt, GOP=2s.)
 
-**Als Nächstes:** VAAPI auf echter AMD/Intel-Hardware verifizieren; Resolution-Override →
-GPU-Scale; ggf. Audio-Silence-Insertion bei PipeWire-xruns (GSR macht das gegen Drift).
+**Restart-Fixes (2026-07-11):** (1) `reap_finished()` im StreamController — endet der
+Worker von selbst (Ingest-Fehler/EOF), räumt der nächste `start`/`state` die tote Session
+ab statt mit „ein Stream läuft bereits" zu blocken. (2) Portal nutzt eine **prozessweite**
+Tokio-Runtime (`portal_runtime()`): die frühere Wegwerf-Runtime pro `open()` tötete den
+zbus-I/O-Treiber der prozessweit gecachten Session-Bus-Verbindung → zweiter Stream hing
+stumm im Portal-Dialog.
+
+**Settings real umgesetzt (2026-07-11):** fps-Clamp 1..=1000 (war 120); `show_cursor`
+→ `portal::open(bool)`; Resolution-Token (`Native/4K/1440p/1080p/720p/480p` + `WxH`,
+Mapping wie Python `RESOLUTION_TARGETS`) → **GPU-Scale**: aspektwahrend in die Box, nie
+Upscale, gerade Maße (`ResolutionRequest::target_for`) — NVENC skaliert per
+FBO-Blit (LINEAR) EGLImage→Staging (`nv_import`, Staging hat IMMER Ausgabe-Größe),
+VAAPI via `scale_vaapi=w:h:format=nv12` im selben VPP-Durchgang.
+
+**Audio-Modi (2026-07-11, `capture/audio_router.rs`):** GSR-Modell — eigener Null-Sink
+(`support.null-audio-sink`), App-Streams (`Stream/Output/Audio`) werden per
+`link-factory` ZUSÄTZLICH auf ihn gelinkt, Capture hängt an dessen Monitor
+(`target.object`-Literal — die pw::keys-Konstante ist feature-gegated). Modi:
+`Desktop` = alle Apps außer Excludes (+ IMMER "Pulse", Echo-Schutz wie Python),
+`App: <name>` = genau eine App (case-insensitive), `Mikrofon` = Default-Input ohne
+Router. Registry wird live beobachtet (Apps, die mittendrin starten, werden
+nachgelinkt). `list_application_audio` enumeriert real (`application.name`-Dedup).
+"Desktop + Mikrofon" = vorerst nur Desktop (Warnung in `ops::start`).
+
+**Als Nächstes:** VAAPI auf echter AMD/Intel-Hardware verifizieren; Mikrofon-Mix für
+"Desktop + Mikrofon"; ggf. Audio-Silence-Insertion bei PipeWire-xruns (GSR macht das
+gegen Drift).
 
 ## Memory / Plan
 - Projekt-Memory: `~/.claude/projects/-home-michael-Dokumente-Linux-Rust-Sidecar/memory/`

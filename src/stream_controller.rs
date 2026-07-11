@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use ffmpeg_next as ffmpeg;
 
-use crate::capture::audio::{self, AudioCapture};
+use crate::capture::audio::{self, AudioCapture, AudioSelection};
 use crate::capture::pipewire_stream::{DmabufFrame, PipewireCapture};
 use crate::capture::portal;
 use crate::encode::audio::AudioEncoder;
@@ -79,8 +79,9 @@ impl AudioPipeline {
         mux: MuxSender,
         record_start: Instant,
         av_offset_ms: i32,
+        selection: &AudioSelection,
     ) -> Result<Self> {
-        let (rx, cap) = AudioCapture::start()?;
+        let (rx, cap) = AudioCapture::start(selection)?;
         let worker = thread::Builder::new()
             .name("hq-audio-encode".into())
             .spawn(move || {
@@ -123,16 +124,109 @@ impl AudioPipeline {
     }
 }
 
+/// Gewünschte Ausgabe-Auflösung. `Exact` ist eine BOX, in die aspektwahrend
+/// eingepasst wird (16:9-Monitor + 16:9-Token → exakt der Token; 21:9-Monitor
+/// wird NICHT verzerrt). Es wird nie hochskaliert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionRequest {
+    Native,
+    Exact(u32, u32),
+}
+
+impl ResolutionRequest {
+    /// Wire-Format: Token (`Native`/`4K`/`1440p`/`1080p`/`720p`/`480p`, wie der
+    /// Python-Sidecar `RESOLUTION_TARGETS`) oder literal `WxH`. Unbekanntes →
+    /// Native (kein Fehler — ein Streaming-Start soll daran nicht scheitern).
+    pub fn parse(s: Option<&str>) -> Self {
+        let Some(s) = s.map(str::trim) else {
+            return Self::Native;
+        };
+        match s {
+            "" | "Native" => Self::Native,
+            "4K" => Self::Exact(3840, 2160),
+            "1440p" => Self::Exact(2560, 1440),
+            "1080p" => Self::Exact(1920, 1080),
+            "720p" => Self::Exact(1280, 720),
+            "480p" => Self::Exact(854, 480),
+            other => other
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .filter(|&(w, h): &(u32, u32)| w > 0 && h > 0)
+                .map(|(w, h)| Self::Exact(w, h))
+                .unwrap_or(Self::Native),
+        }
+    }
+
+    /// Ausgabemaße für eine native Capture-Größe: aspektwahrend in die Box
+    /// einpassen, nie hochskalieren, Maße auf gerade Werte runden (Encoder-
+    /// Anforderung bei 4:2:0).
+    pub fn target_for(&self, native_w: u32, native_h: u32) -> (u32, u32) {
+        let even = |n: u32| (n & !1).max(2);
+        match *self {
+            Self::Native => (even(native_w), even(native_h)),
+            Self::Exact(box_w, box_h) => {
+                let scale = f64::min(
+                    box_w as f64 / native_w.max(1) as f64,
+                    box_h as f64 / native_h.max(1) as f64,
+                )
+                .min(1.0); // kein Upscale
+                let w = (native_w as f64 * scale).round() as u32;
+                let h = (native_h as f64 * scale).round() as u32;
+                (even(w), even(h))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ResolutionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native => write!(f, "native"),
+            Self::Exact(w, h) => write!(f, "{w}x{h}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::ResolutionRequest as R;
+
+    #[test]
+    fn parse_tokens() {
+        assert_eq!(R::parse(None), R::Native);
+        assert_eq!(R::parse(Some("Native")), R::Native);
+        assert_eq!(R::parse(Some("1080p")), R::Exact(1920, 1080));
+        assert_eq!(R::parse(Some("4K")), R::Exact(3840, 2160));
+        assert_eq!(R::parse(Some("854x480")), R::Exact(854, 480));
+        assert_eq!(R::parse(Some("Quatsch")), R::Native); // unbekannt → Native
+        assert_eq!(R::parse(Some("0x100")), R::Native);
+    }
+
+    #[test]
+    fn target_scales_down_keeps_aspect_never_up() {
+        // 4K-Monitor + 1080p-Wunsch → exakt 1080p.
+        assert_eq!(R::Exact(1920, 1080).target_for(3840, 2160), (1920, 1080));
+        // Kein Upscale: Quelle kleiner als Box → nativ.
+        assert_eq!(R::Exact(1920, 1080).target_for(1280, 720), (1280, 720));
+        // 21:9 wird eingepasst, nicht verzerrt (Höhe < 1080).
+        let (w, h) = R::Exact(1920, 1080).target_for(3440, 1440);
+        assert_eq!(w, 1920);
+        assert!(h < 1080 && h % 2 == 0, "aspektwahrend + gerade: {h}");
+        // Native rundet nur auf gerade Maße.
+        assert_eq!(R::Native.target_for(1279, 719), (1278, 718));
+    }
+}
+
 /// Aufgelöste Parameter für einen Stream (gebaut von `ops::start`).
 pub struct StartParams {
     pub codec: String,
-    pub width: u32,
-    pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub push_url: String,
-    pub enable_audio: bool,
+    pub audio: AudioSelection,
     pub av_offset_ms: i32,
+    pub show_cursor: bool,
+    pub resolution: ResolutionRequest,
 }
 
 pub struct StreamSnapshot {
@@ -182,6 +276,27 @@ fn emit(event: Event) {
     }
 }
 
+/// Räumt einen bereits beendeten (aber nie per `stop` abgeholten) Stream ab.
+///
+/// Endet der Worker von selbst — Ingest-Fehler (`Connection refused`), EOF, GPU-
+/// Fehler —, setzt er nur `shared.running = false`, lässt aber `active = Some(..)`
+/// stehen (nur `stop` ruft `take()`). Ohne dieses Einsammeln blockiert der
+/// nächste `start` fälschlich mit „ein Stream läuft bereits" und `state` meldet
+/// „starting" statt „idle", bis der User manuell stoppt. `worker.join()` kehrt
+/// sofort zurück, weil der Thread bereits beendet ist. Läuft nie im Worker-Thread
+/// selbst (nur aus `start`/`state`), daher kein Self-Join. Muss unter gehaltenem
+/// `active`-Lock aufgerufen werden.
+fn reap_finished(guard: &mut Option<Active>) {
+    let finished = guard
+        .as_ref()
+        .is_some_and(|a| !a.shared.running.load(Ordering::SeqCst));
+    if finished {
+        if let Some(dead) = guard.take() {
+            let _ = dead.worker.join();
+        }
+    }
+}
+
 impl StreamController {
     pub fn singleton() -> &'static StreamController {
         INSTANCE.get_or_init(|| StreamController { active: Mutex::new(None) })
@@ -190,6 +305,7 @@ impl StreamController {
     /// Start a stream. `argv` is the redacted diagnostic argv (for `state`).
     pub fn start(&self, params: StartParams, argv: Vec<String>) -> Result<()> {
         let mut guard = self.active.lock().unwrap();
+        reap_finished(&mut guard);
         if guard.is_some() {
             return Err(anyhow!("ein Stream läuft bereits"));
         }
@@ -239,7 +355,8 @@ impl StreamController {
     }
 
     pub fn state(&self) -> StreamSnapshot {
-        let guard = self.active.lock().unwrap();
+        let mut guard = self.active.lock().unwrap();
+        reap_finished(&mut guard);
         match guard.as_ref() {
             Some(a) => {
                 let running = a.shared.running.load(Ordering::SeqCst);
@@ -288,7 +405,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     emit(Event::Log {
         line: "[stream] öffne Portal-Dialog zur Quellenauswahl …".to_string(),
     });
-    let session = portal::open(true).map_err(|e| {
+    let session = portal::open(params.show_cursor).map_err(|e| {
         if portal::is_portal_canceled(&e) {
             anyhow!("Quellenauswahl abgebrochen")
         } else {
@@ -315,12 +432,18 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         .recv_timeout(Duration::from_secs(10))
         .map_err(|_| anyhow!("kein Bild vom Compositor in 10s (ist die Quelle sichtbar?)"))?;
     let (width, height) = (first.width, first.height);
-    if width != params.width || height != params.height {
+
+    // Ausgabe-Auflösung: gewünschte Box aspektwahrend auf die native Größe
+    // anwenden (kein Upscale). Die Skalierung selbst macht die GPU im Importer
+    // (NVENC: GL-Blit ins Staging; VAAPI: scale_vaapi).
+    let (out_w, out_h) = params.resolution.target_for(width, height);
+    if (out_w, out_h) != (width, height) {
         emit(Event::Log {
-            line: format!(
-                "[stream] streame in nativer Auflösung {width}x{height} (angefragt {}x{}; Skalierung folgt später)",
-                params.width, params.height
-            ),
+            line: format!("[stream] skaliere {width}x{height} → {out_w}x{out_h} (GPU)"),
+        });
+    } else {
+        emit(Event::Log {
+            line: format!("[stream] streame in nativer Auflösung {width}x{height}"),
         });
     }
 
@@ -331,18 +454,26 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             let hw_ctx = hw::HwContext::create(
                 hw::HwDeviceKind::Cuda,
                 None,
-                width,
-                height,
+                out_w,
+                out_h,
                 ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
             )?;
-            let imp = NvDmabufImporter::new()?;
+            let imp = NvDmabufImporter::new(out_w, out_h)?;
             FrameImporter::Nvenc { imp, hw: hw_ctx }
         }
         Vendor::Amd | Vendor::Intel => {
             emit(Event::Log {
                 line: "[stream] VAAPI-Capture-Pfad (AMD/Intel) — auf dieser Hardware nicht getestet".to_string(),
             });
-            let imp = VaapiImporter::new(&render_node, first.drm_fourcc, width, height, params.fps)?;
+            let imp = VaapiImporter::new(
+                &render_node,
+                first.drm_fourcc,
+                width,
+                height,
+                params.fps,
+                out_w,
+                out_h,
+            )?;
             FrameImporter::Vaapi { imp }
         }
     };
@@ -354,10 +485,10 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         codec: params.codec.clone(),
         fps: params.fps,
         bitrate_kbps: params.bitrate_kbps,
-        width,
-        height,
+        width: out_w,
+        height: out_h,
     };
-    let audio_params = params.enable_audio.then(|| AudioParams {
+    let audio_params = params.audio.enabled().then(|| AudioParams {
         sample_rate: audio::SAMPLE_RATE,
         bitrate_kbps: AUDIO_BITRATE_KBPS,
     });
@@ -377,17 +508,18 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     // Audio-Nebenpfad starten (teilt sich den Muxer über einen MuxSender),
     // verankert an record_start + av_offset_ms.
     let mut audio_pipeline = match audio_enc {
-        Some(ae) => match enc
-            .mux_sender()
-            .and_then(|s| AudioPipeline::start(ae, s, record_start, params.av_offset_ms))
-        {
+        Some(ae) => match enc.mux_sender().and_then(|s| {
+            AudioPipeline::start(ae, s, record_start, params.av_offset_ms, &params.audio)
+        }) {
             Ok(p) => {
                 let off = if params.av_offset_ms != 0 {
                     format!(" (av_offset={}ms)", params.av_offset_ms)
                 } else {
                     String::new()
                 };
-                emit(Event::Log { line: format!("[stream] Audio: Sink-Monitor → Opus{off}") });
+                emit(Event::Log {
+                    line: format!("[stream] Audio: {} → Opus{off}", params.audio.describe()),
+                });
                 Some(p)
             }
             Err(e) => {

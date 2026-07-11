@@ -13,13 +13,37 @@
 //! `~/.config/xdg-desktop-portal/portals.conf` (ScreenCast=gnome).
 
 use std::os::fd::OwnedFd;
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use tokio::runtime::Runtime;
 
 /// Exit-Code bei User-Abbruch des Portal-Dialogs (GSR-Konvention).
 pub const EXIT_PORTAL_CANCELED: i32 = 60;
+
+/// Prozess-globale Tokio-Runtime für ALLE Portal-Verhandlungen.
+///
+/// Früher baute `open()` pro Aufruf eine eigene `current_thread`-Runtime und ließ
+/// sie am Ende fallen. ashpd spricht aber über `zbus`, dessen Session-Bus-
+/// Verbindung PROZESSWEIT gecacht ist (`zbus::Connection::session()` in einer
+/// statischen `OnceCell`) — deren I/O-Treiber-Task lebt auf der Runtime, die beim
+/// ERSTEN Aufruf aktiv war. Wird diese Runtime gedroppt, stirbt der Treiber,
+/// während die Verbindung im Cache liegen bleibt. Der zweite Stream bekam so eine
+/// tote Verbindung: `Start` (Portal-Dialog) sendete zwar, aber niemand las die
+/// Antwort → Hänger direkt nach „öffne Portal-Dialog". Eine einzige dauerhafte
+/// Multi-Thread-Runtime hält den Treiber über alle Streams am Leben.
+fn portal_runtime() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("portal tokio runtime bauen")
+    })
+}
 
 /// Ergebnis der Portal-Verhandlung: PipeWire-fd + node_id + Quell-Größe.
 pub struct PortalSession {
@@ -37,12 +61,7 @@ pub struct PortalSession {
 /// Verhandle eine ScreenCast-Session. Öffnet den Portal-Dialog (User wählt
 /// Quelle). `show_cursor=true` → Cursor eingebettet (Embedded), sonst Hidden.
 pub fn open(show_cursor: bool) -> Result<PortalSession> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow!("tokio runtime: {e}"))?;
-
-    rt.block_on(async move {
+    portal_runtime().block_on(async move {
         let sc = Screencast::new()
             .await
             .map_err(|e| anyhow!("Screencast::new: {e}"))?;

@@ -1,13 +1,18 @@
-//! PipeWire-Audio-Capture: System-Ausgabeton (Sink-Monitor) → interleaved
-//! Float32-Stereo @48kHz, direkt als Opus-Encoder-Input.
+//! PipeWire-Audio-Capture → interleaved Float32-Stereo @48kHz, direkt als
+//! Opus-Encoder-Input. Modusabhängig (siehe [`AudioSelection`]):
 //!
-//! Anders als der Video-Pfad braucht Audio **kein** Portal — der Sink-Monitor
-//! (`PW_KEY_STREAM_CAPTURE_SINK=true`) ist für jeden Client lesbar. Wir
-//! verbinden auf den Default-Graph (`connect_rc(None)`) und fordern F32LE /
-//! 48000 / 2ch im EnumFormat an; PipeWire konvertiert (Adapter) automatisch.
+//! - **Desktop / App**: eigener Capture-Sink via [`audio_router`] (Null-Sink,
+//!   auf den nur die gewünschten App-Streams gelinkt werden — Desktop schließt
+//!   Pulse selbst + user-Excludes aus, App linkt genau eine App). Der Stream
+//!   hier hängt am Monitor DIESES Sinks (`TARGET_OBJECT` + CAPTURE_SINK).
+//! - **Mikrofon**: Default-Input (AUTOCONNECT, kein CAPTURE_SINK).
 //!
-//! Threading wie `pipewire_stream`: MainLoop+Context+Stream leben auf EINEM
-//! Worker-Thread (pipewire-rs nutzt `Rc`), nach außen geht nur der
+//! Audio braucht **kein** Portal. Wir verbinden auf den Default-Graph
+//! (`connect_rc(None)`) und fordern F32LE / 48000 / 2ch im EnumFormat an;
+//! PipeWire konvertiert (Adapter) automatisch.
+//!
+//! Threading wie `pipewire_stream`: MainLoop+Context+Stream(+Router) leben auf
+//! EINEM Worker-Thread (pipewire-rs nutzt `Rc`), nach außen geht nur der
 //! `mpsc::Receiver<Vec<f32>>` (Send). Stop über `pw::channel` → `quit()`.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -21,10 +26,79 @@ use spa::param::format::{MediaSubtype, MediaType};
 use spa::param::format_utils;
 use spa::pod::Pod;
 
+use super::audio_router::{AudioRouter, RouteMode};
+
 /// Ziel-Sample-Rate — Opus arbeitet nativ mit 48kHz.
 pub const SAMPLE_RATE: u32 = 48_000;
 /// Stereo (interleaved FL,FR).
 pub const CHANNELS: u32 = 2;
+
+/// Node-Name der eigenen Electron-Audio-Streams (via `PULSE_PROP` in
+/// `desktop/electron/main.ts`). Bei Desktop-Capture IMMER ausgeschlossen,
+/// damit Pulses Voice-Wiedergabe nicht als Echo im Stream landet — gleiche
+/// Konvention wie der Python-Sidecar (`profiles.py::PULSE_SELF_NODE_NAME`).
+pub const PULSE_SELF_NODE_NAME: &str = "Pulse";
+
+/// UI-Prefix für App-spezifisches Capture (`"App: <name>"` auf der Leitung,
+/// wie `APP_AUDIO_PREFIX` im Frontend / `APP_LABEL_PREFIX` in Python).
+const APP_AUDIO_PREFIX: &str = "App: ";
+
+/// Aufgelöster Audio-Modus eines Streams.
+#[derive(Debug, Clone)]
+pub enum AudioSelection {
+    Off,
+    /// Default-Mikrofon.
+    Mic,
+    /// System-Ton = alle App-Streams außer `exclude` (enthält immer "Pulse").
+    Desktop { exclude: Vec<String> },
+    /// Nur der Ton EINER App.
+    App { name: String },
+}
+
+impl AudioSelection {
+    /// Wire-`audio.mode` + `excluded_apps` → Selection. Unbekanntes → Off
+    /// (ein Streaming-Start soll an Audio nie scheitern). "Desktop + Mikrofon"
+    /// wird als Desktop behandelt (Mikrofon-Mix noch nicht implementiert —
+    /// Warnung loggt `ops::start`).
+    pub fn parse(mode: &str, mut excluded_apps: Vec<String>) -> Self {
+        let mode = mode.trim();
+        let mode = mode.strip_suffix(" (offline)").unwrap_or(mode).trim();
+        if let Some(app) = mode.strip_prefix(APP_AUDIO_PREFIX) {
+            let app = app.trim();
+            if !app.is_empty() {
+                return Self::App { name: app.to_string() };
+            }
+            return Self::Off;
+        }
+        match mode {
+            "Mikrofon" => Self::Mic,
+            "Desktop" | "Desktop + Mikrofon" => {
+                if !excluded_apps
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(PULSE_SELF_NODE_NAME))
+                {
+                    excluded_apps.push(PULSE_SELF_NODE_NAME.to_string());
+                }
+                Self::Desktop { exclude: excluded_apps }
+            }
+            _ => Self::Off,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Menschlich lesbare Kurzform fürs Stream-Log.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Off => "aus".to_string(),
+            Self::Mic => "Mikrofon".to_string(),
+            Self::Desktop { exclude } => format!("Desktop (ohne {})", exclude.join(", ")),
+            Self::App { name } => format!("nur App \u{201e}{name}\u{201c}"),
+        }
+    }
+}
 
 struct AudioData {
     sample_tx: Sender<Vec<f32>>,
@@ -38,16 +112,20 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    /// Starte die Sink-Monitor-Capture. Liefert interleaved F32-Stereo-Chunks
-    /// (Länge variabel, ein Chunk pro PipeWire-`process`).
-    pub fn start() -> anyhow::Result<(Receiver<Vec<f32>>, Self)> {
+    /// Starte die Capture für den gegebenen Modus. Liefert interleaved
+    /// F32-Stereo-Chunks (Länge variabel, ein Chunk pro PipeWire-`process`).
+    pub fn start(selection: &AudioSelection) -> anyhow::Result<(Receiver<Vec<f32>>, Self)> {
+        if !selection.enabled() {
+            anyhow::bail!("AudioCapture::start mit AudioSelection::Off");
+        }
+        let selection = selection.clone();
         let (sample_tx, sample_rx) = channel::<Vec<f32>>();
         let (stop_tx, stop_rx) = pw::channel::channel::<()>();
 
         let worker = thread::Builder::new()
             .name("pipewire-audio".into())
             .spawn(move || {
-                if let Err(e) = run_audio(sample_tx, stop_rx) {
+                if let Err(e) = run_audio(selection, sample_tx, stop_rx) {
                     tracing::error!(target: "audio", "Audio-Capture-Thread: {e:#}");
                 }
             })?;
@@ -62,7 +140,11 @@ impl AudioCapture {
     }
 }
 
-fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) -> anyhow::Result<()> {
+fn run_audio(
+    selection: AudioSelection,
+    sample_tx: Sender<Vec<f32>>,
+    stop_rx: pw::channel::Receiver<()>,
+) -> anyhow::Result<()> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -73,6 +155,35 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
+    // Modusabhängig: Desktop/App bekommen einen Router (eigener Capture-Sink,
+    // auf den nur die gewünschten Quellen gelinkt werden) und der Stream hängt
+    // an DESSEN Monitor; Mikrofon connectet direkt auf den Default-Input.
+    // Der Router muss bis Mainloop-Ende leben (hält Sink + Links).
+    let _router = match &selection {
+        AudioSelection::Desktop { exclude } => Some(AudioRouter::start(
+            &core,
+            RouteMode::All { exclude: exclude.clone() },
+        )?),
+        AudioSelection::App { name } => {
+            Some(AudioRouter::start(&core, RouteMode::App { name: name.clone() })?)
+        }
+        AudioSelection::Mic => None,
+        AudioSelection::Off => unreachable!("start() weist Off ab"),
+    };
+
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Music",
+    };
+    if let Some(router) = &_router {
+        // Monitor unseres eigenen Capture-Sinks — NICHT der Default-Sink.
+        // ("target.object" literal: die pw::keys-Konstante ist hinter einem
+        // höheren Version-Feature-Gate, der Key selbst ist seit 0.3.44 stabil.)
+        props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+        props.insert("target.object", router.sink_name());
+    }
+
     // Angefordertes Format (EnumFormat). `AudioData.info` bleibt Default und
     // nimmt beim `param_changed` das tatsächlich negotiierte Format auf.
     let mut req = AudioInfoRaw::new();
@@ -81,17 +192,7 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
     req.set_channels(CHANNELS);
     let data = AudioData { sample_tx, info: AudioInfoRaw::new() };
 
-    let stream = pw::stream::StreamRc::new(
-        core,
-        "pulse-linux-hq-sidecar-audio",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_ROLE => "Music",
-            // Sink-Monitor: das, was der User hört (System-Ausgabe).
-            *pw::keys::STREAM_CAPTURE_SINK => "true",
-        },
-    )?;
+    let stream = pw::stream::StreamRc::new(core, "pulse-linux-hq-sidecar-audio", props)?;
 
     let _listener = stream
         .add_local_listener_with_user_data(data)
@@ -169,4 +270,37 @@ fn run_audio(sample_tx: Sender<Vec<f32>>, stop_rx: pw::channel::Receiver<()>) ->
     mainloop.run();
     tracing::debug!(target: "audio", "Audio-Mainloop beendet (stop)");
     Ok(())
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::AudioSelection as S;
+
+    #[test]
+    fn parse_modes() {
+        assert!(matches!(S::parse("Aus", vec![]), S::Off));
+        assert!(matches!(S::parse("Unbekannt", vec![]), S::Off));
+        assert!(matches!(S::parse("Mikrofon", vec![]), S::Mic));
+        match S::parse("App: Firefox", vec![]) {
+            S::App { name } => assert_eq!(name, "Firefox"),
+            other => panic!("erwartet App, war {other:?}"),
+        }
+        assert!(matches!(S::parse("App: ", vec![]), S::Off)); // leerer Name
+    }
+
+    #[test]
+    fn desktop_always_excludes_pulse() {
+        match S::parse("Desktop", vec!["Spotify".into()]) {
+            S::Desktop { exclude } => {
+                assert!(exclude.iter().any(|e| e == "Spotify"));
+                assert!(exclude.iter().any(|e| e == "Pulse"));
+            }
+            other => panic!("erwartet Desktop, war {other:?}"),
+        }
+        // Case-insensitiv: kein Duplikat, wenn "pulse" schon drin ist.
+        match S::parse("Desktop + Mikrofon", vec!["pulse".into()]) {
+            S::Desktop { exclude } => assert_eq!(exclude.len(), 1),
+            other => panic!("erwartet Desktop, war {other:?}"),
+        }
+    }
 }

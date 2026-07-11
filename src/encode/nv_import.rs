@@ -62,6 +62,14 @@ const GL_RGBA8: u32 = 0x8058;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_NEAREST: i32 = 0x2600;
+// Framebuffer-Blit (Downscale-Pfad): Quelle ≠ Zielgröße → glBlitFramebuffer
+// mit LINEAR-Filter statt glCopyImageSubData (das kann nur 1:1).
+const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
+const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+const GL_FRAMEBUFFER: u32 = 0x8D40;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
+const GL_LINEAR: u32 = 0x2601;
 
 // ── CUDA-Konstanten/-Typen (cuda.h) ─────────────────────────────────────────
 const CUDA_SUCCESS: i32 = 0;
@@ -128,6 +136,16 @@ type FnGlCopyImageSubData = unsafe extern "C" fn(
     u32, u32, i32, i32, i32, i32, // dst: name, target, level, x, y, z
     i32, i32, i32, // width, height, depth
 );
+type FnGlGenFramebuffers = unsafe extern "C" fn(i32, *mut u32);
+type FnGlDeleteFramebuffers = unsafe extern "C" fn(i32, *const u32);
+type FnGlBindFramebuffer = unsafe extern "C" fn(u32, u32);
+type FnGlFramebufferTexture2D = unsafe extern "C" fn(u32, u32, u32, u32, i32);
+#[allow(clippy::type_complexity)]
+type FnGlBlitFramebuffer = unsafe extern "C" fn(
+    i32, i32, i32, i32, // src x0 y0 x1 y1
+    i32, i32, i32, i32, // dst x0 y0 x1 y1
+    u32, u32, // mask, filter
+);
 
 type FnCuInit = unsafe extern "C" fn(u32) -> i32;
 type FnCuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
@@ -180,10 +198,21 @@ pub struct NvDmabufImporter {
     gl_tex_storage_2d: FnGlTexStorage2D,
     gl_tex_parameteri: FnGlTexParameteri,
     gl_copy_image_sub_data: FnGlCopyImageSubData,
+    gl_gen_framebuffers: FnGlGenFramebuffers,
+    gl_delete_framebuffers: FnGlDeleteFramebuffers,
+    gl_bind_framebuffer: FnGlBindFramebuffer,
+    gl_framebuffer_texture_2d: FnGlFramebufferTexture2D,
+    gl_blit_framebuffer: FnGlBlitFramebuffer,
 
     /// RGBA8-Staging-Textur (einmal bei CUDA registriert) — Ziel des
-    /// GPU-Copies aus der EGLImage-Textur, Quelle des cuMemcpy2D.
+    /// GPU-Copies/-Blits aus der EGLImage-Textur, Quelle des cuMemcpy2D.
+    /// Hat IMMER die Ausgabe-Größe (`out_w`×`out_h`) — weicht die Capture-
+    /// Größe ab, skaliert der Blit (LINEAR) beim Kopieren.
     staging: Option<Staging>,
+    /// FBO-Paar für den Blit-Pfad (read = EGLImage-Textur, draw = Staging).
+    fbos: [u32; 2],
+    out_w: u32,
+    out_h: u32,
 
     cu_device: i32,
     cu_ctx: CuContext,
@@ -222,7 +251,10 @@ impl NvDmabufImporter {
     /// Lade libEGL+libcuda, baue GL-Context auf dem NVIDIA-Device und retaine
     /// den CUDA-Primary-Context. MUSS auf dem Thread laufen, der auch
     /// `import` ruft (eglMakeCurrent ist thread-affin).
-    pub fn new() -> Result<Self> {
+    ///
+    /// `out_w`/`out_h`: Ausgabe-Größe (= Encoder-Größe). Weicht die Capture-
+    /// Größe davon ab, skaliert der Import per Framebuffer-Blit auf der GPU.
+    pub fn new(out_w: u32, out_h: u32) -> Result<Self> {
         unsafe {
             let egl_lib = libloading::Library::new("libEGL.so.1")
                 .or_else(|_| libloading::Library::new("libEGL.so"))
@@ -264,6 +296,15 @@ impl NvDmabufImporter {
             let gl_tex_parameteri = egl_proc!(get_proc, "glTexParameteri", FnGlTexParameteri);
             let gl_copy_image_sub_data =
                 egl_proc!(get_proc, "glCopyImageSubData", FnGlCopyImageSubData);
+            let gl_gen_framebuffers =
+                egl_proc!(get_proc, "glGenFramebuffers", FnGlGenFramebuffers);
+            let gl_delete_framebuffers =
+                egl_proc!(get_proc, "glDeleteFramebuffers", FnGlDeleteFramebuffers);
+            let gl_bind_framebuffer = egl_proc!(get_proc, "glBindFramebuffer", FnGlBindFramebuffer);
+            let gl_framebuffer_texture_2d =
+                egl_proc!(get_proc, "glFramebufferTexture2D", FnGlFramebufferTexture2D);
+            let gl_blit_framebuffer =
+                egl_proc!(get_proc, "glBlitFramebuffer", FnGlBlitFramebuffer);
 
             // NVIDIA-Device suchen: Kandidaten durchprobieren, Context bauen,
             // GL_VENDOR prüfen. (Mesa-Devices würden bei
@@ -365,7 +406,7 @@ impl NvDmabufImporter {
                 return Err(anyhow!("cuDevicePrimaryCtxRetain failed (rc={r})"));
             }
 
-            Ok(Self {
+            let mut me = Self {
                 _egl_lib: egl_lib,
                 _cuda_lib: cuda_lib,
                 dpy,
@@ -384,7 +425,15 @@ impl NvDmabufImporter {
                 gl_tex_storage_2d,
                 gl_tex_parameteri,
                 gl_copy_image_sub_data,
+                gl_gen_framebuffers,
+                gl_delete_framebuffers,
+                gl_bind_framebuffer,
+                gl_framebuffer_texture_2d,
+                gl_blit_framebuffer,
                 staging: None,
+                fbos: [0; 2],
+                out_w,
+                out_h,
                 cu_device,
                 cu_ctx,
                 cu_primary_ctx_release,
@@ -397,7 +446,12 @@ impl NvDmabufImporter {
                 cu_unregister_resource,
                 cu_memcpy_2d,
                 cu_ctx_synchronize,
-            })
+            };
+            // FBO-Paar für den Skalier-Blit + Staging in Ausgabe-Größe —
+            // beides einmalig (Context ist current auf diesem Thread).
+            (me.gl_gen_framebuffers)(2, me.fbos.as_mut_ptr());
+            me.ensure_staging()?;
+            Ok(me)
         }
     }
 
@@ -406,7 +460,7 @@ impl NvDmabufImporter {
     /// bleiben beim Caller (er schließt sie nach dem Import).
     /// Caller besitzt das zurückgegebene Frame (`av_frame_free`).
     pub fn import(&mut self, frame: &DmabufFrame, hw: &HwContext) -> Result<*mut AVFrame> {
-        self.ensure_staging(frame.width, frame.height)?;
+        self.ensure_staging()?;
         let mut dst = hw.alloc_hwframe()?;
         match self.copy_into(frame, dst) {
             Ok(()) => Ok(dst),
@@ -417,9 +471,10 @@ impl NvDmabufImporter {
         }
     }
 
-    /// Staging-Textur (RGBA8, w×h) anlegen und einmalig bei CUDA
-    /// registrieren; bei Größenwechsel neu aufbauen.
-    fn ensure_staging(&mut self, width: u32, height: u32) -> Result<()> {
+    /// Staging-Textur (RGBA8, Ausgabe-Größe) anlegen und einmalig bei CUDA
+    /// registrieren.
+    fn ensure_staging(&mut self) -> Result<()> {
+        let (width, height) = (self.out_w, self.out_h);
         if let Some(s) = &self.staging {
             if s.width == width && s.height == height {
                 return Ok(());
@@ -552,27 +607,52 @@ impl NvDmabufImporter {
             }
             (self.gl_bind_texture)(GL_TEXTURE_2D, 0);
 
-            // Raw-Texel-Copy EGLImage-Textur → Staging (Detile passiert im
-            // Treiber). CUDA sieht danach die Staging-Textur; die Map-
-            // Operation synchronisiert implizit mit vorherigem GL.
-            let w = (frame.width.min(staging.width)) as i32;
-            let h = (frame.height.min(staging.height)) as i32;
-            (self.gl_copy_image_sub_data)(
-                tex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                staging.tex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                w, h, 1,
-            );
+            // EGLImage-Textur → Staging. Gleiche Größe: Raw-Texel-Copy (Detile
+            // passiert im Treiber). Andere Größe: Framebuffer-Blit mit LINEAR-
+            // Filter = GPU-Downscale in einem Schritt. CUDA sieht danach die
+            // Staging-Textur; die Map-Operation synchronisiert implizit mit
+            // vorherigem GL.
+            if frame.width == staging.width && frame.height == staging.height {
+                (self.gl_copy_image_sub_data)(
+                    tex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                    staging.tex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                    staging.width as i32, staging.height as i32, 1,
+                );
+            } else {
+                (self.gl_bind_framebuffer)(GL_READ_FRAMEBUFFER, self.fbos[0]);
+                (self.gl_framebuffer_texture_2d)(
+                    GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0,
+                );
+                (self.gl_bind_framebuffer)(GL_DRAW_FRAMEBUFFER, self.fbos[1]);
+                (self.gl_framebuffer_texture_2d)(
+                    GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, staging.tex, 0,
+                );
+                (self.gl_blit_framebuffer)(
+                    0, 0, frame.width as i32, frame.height as i32,
+                    0, 0, staging.width as i32, staging.height as i32,
+                    GL_COLOR_BUFFER_BIT, GL_LINEAR,
+                );
+                // Texturen detachen, bevor `tex` gelöscht wird (dangling
+                // Attachment) — und den FBO-Bind zurücksetzen.
+                (self.gl_framebuffer_texture_2d)(
+                    GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
+                );
+                (self.gl_framebuffer_texture_2d)(
+                    GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0,
+                );
+                (self.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
+            }
             let gl_err = (self.gl_get_error)();
             (self.gl_delete_textures)(1, &tex);
             if gl_err != GL_NO_ERROR {
-                return Err(anyhow!("glCopyImageSubData failed (glError={gl_err:#06x})"));
+                return Err(anyhow!("GL copy/blit → staging failed (glError={gl_err:#06x})"));
             }
 
-            self.cuda_copy(staging.cu_res, frame, dst)
+            self.cuda_copy(staging.cu_res, dst)
         }
     }
 
-    unsafe fn cuda_copy(&self, res: CuGraphicsResource, frame: &DmabufFrame, dst: *mut AVFrame) -> Result<()> {
+    unsafe fn cuda_copy(&self, res: CuGraphicsResource, dst: *mut AVFrame) -> Result<()> {
         unsafe {
             let r = (self.cu_ctx_push)(self.cu_ctx);
             if r != CUDA_SUCCESS {
@@ -593,11 +673,13 @@ impl NvDmabufImporter {
                         ));
                     }
 
-                    // ARRAY (Staging-Textur) → DEVICE (linear, ffmpeg data[0]).
+                    // ARRAY (Staging-Textur, Ausgabe-Größe) → DEVICE (linear,
+                    // ffmpeg data[0]). Beide sind out_w×out_h — min() nur als
+                    // Schutzgurt.
                     let dst_w = (*dst).width.max(0) as usize;
                     let dst_h = (*dst).height.max(0) as usize;
-                    let copy_w = (frame.width as usize).min(dst_w) * 4;
-                    let copy_h = (frame.height as usize).min(dst_h);
+                    let copy_w = (self.out_w as usize).min(dst_w) * 4;
+                    let copy_h = (self.out_h as usize).min(dst_h);
                     let cpy = CudaMemcpy2D {
                         src_x_in_bytes: 0,
                         src_y: 0,
@@ -642,6 +724,9 @@ impl Drop for NvDmabufImporter {
     fn drop(&mut self) {
         self.drop_staging();
         unsafe {
+            if self.fbos != [0; 2] {
+                (self.gl_delete_framebuffers)(2, self.fbos.as_ptr());
+            }
             (self.egl_make_current)(self.dpy, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
             (self.egl_destroy_context)(self.dpy, self.ctx);
             (self.egl_terminate)(self.dpy);

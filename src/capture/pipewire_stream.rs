@@ -165,7 +165,9 @@ fn build_format_pod(
         Fraction,
         Fraction { num: 60, denom: 1 },
         Fraction { num: 0, denom: 1 },
-        Fraction { num: 500, denom: 1 }
+        // Deckt den vollen fps-Bereich des Encoders ab (clamp 1..=1000 in
+        // ops::start) — der Compositor liefert eh nur bei Damage.
+        Fraction { num: 1000, denom: 1 }
     ));
 
     let obj = spa::pod::Object {

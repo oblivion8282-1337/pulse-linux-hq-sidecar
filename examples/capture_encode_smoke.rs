@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         height: h,
     };
     let mut enc = VideoEncoder::create(&cfg, &hw_ctx, &out)?;
-    let mut importer = NvDmabufImporter::new()?;
+    let mut importer = NvDmabufImporter::new(w, h)?;
     eprintln!("[capture_encode] Encoder + Importer bereit");
 
     let started = std::time::Instant::now();
