@@ -43,11 +43,28 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         })?;
 
     let overrides = params.get("overrides").and_then(Value::as_object);
-    let codec = overrides
+    let requested_codec = overrides
         .and_then(|o| o.get("codec"))
         .and_then(Value::as_str)
         .unwrap_or(profile.codec)
         .to_string();
+    // Sicherheitsnetz: kann die HW den gewählten Codec nicht encodieren, auf
+    // H.264 zurückfallen statt den Encoder-open crashen zu lassen. Die UI bietet
+    // AV1 auf solcher HW zwar gar nicht erst an (list_profiles filtert über
+    // dieselbe Probe), aber ein veralteter Client / Direktaufruf käme sonst zum
+    // harten Fehler. Geht auch H.264 nicht, bleibt der Wunsch stehen → echter,
+    // ehrlicher Encoder-Fehler.
+    let codec = if crate::caps::supports_codec(&requested_codec) {
+        requested_codec
+    } else if crate::caps::supports_codec("h264") {
+        tracing::warn!(
+            target: "stream", requested = %requested_codec,
+            "Codec von der HW nicht encodierbar → Fallback auf h264"
+        );
+        "h264".to_string()
+    } else {
+        requested_codec
+    };
     let fps = overrides
         .and_then(|o| o.get("fps"))
         .and_then(Value::as_u64)

@@ -220,6 +220,75 @@ impl VideoEncoder {
     }
 }
 
+/// Probe-Auflösung: klein, aber über AV1-Mindestmaßen/Alignment.
+const PROBE_W: u32 = 1280;
+const PROBE_H: u32 = 720;
+
+/// Kann DIESE Hardware den Encoder für `codec` (`h264`/`av1`) wirklich öffnen?
+///
+/// Der EINZIGE verlässliche Test: HW-Frames-Kontext bauen + Encoder öffnen.
+/// Dass `find_by_name` den Encoder findet, sagt NICHTS über die GPU — FFmpeg
+/// linkt `av1_nvenc` auch auf einer Karte ohne AV1-Encode (z. B. RTX 30xx:
+/// AV1 nur decode). NVENC/VAAPI melden erst beim `open`, ob die Hardware den
+/// Codec trägt.
+///
+/// `Ok(true|false)` = Probe lief sauber. `Err` = Device selbst nicht
+/// initialisierbar (Treiber fehlt) → Caller behandelt konservativ (nicht
+/// anbieten).
+pub fn probe_encoder(vendor: Vendor, render_node: &str, codec_id: &str) -> Result<bool> {
+    let Some(name) = opts::encoder_name(vendor, codec_id) else {
+        return Ok(false);
+    };
+    ffmpeg::init().context("ffmpeg::init")?;
+    let Some(desc) = codec::encoder::find_by_name(name) else {
+        return Ok(false); // Encoder nicht ins FFmpeg gelinkt
+    };
+
+    let kind = hw::kind_for(vendor);
+    let (dev_arg, sw) = match vendor {
+        // Eingangsformat wie der echte Pfad: NVENC RGB0 (Blit-Ergebnis),
+        // VAAPI NV12 (scale_vaapi-Ausgang).
+        Vendor::Nvidia => (None, AVPixelFormat::AV_PIX_FMT_RGB0),
+        Vendor::Amd | Vendor::Intel => (Some(render_node), AVPixelFormat::AV_PIX_FMT_NV12),
+    };
+    let hwctx = HwContext::create(kind, dev_arg, PROBE_W, PROBE_H, sw)?;
+
+    // FFmpeg-Logs während der Probe dämpfen — ein fehlgeschlagener open loggt
+    // sonst laute AV_LOG_ERROR-Zeilen in die sidecar.log, obwohl "geht nicht"
+    // hier der ERWARTETE Ausgang ist.
+    let prev = unsafe { av_log_get_level() };
+    unsafe { av_log_set_level(AV_LOG_FATAL) };
+    let ok = probe_open(desc, &hwctx, vendor);
+    unsafe { av_log_set_level(prev) };
+    Ok(ok)
+}
+
+/// Encoder-Context bauen, Frames-Pool binden, `open` versuchen. Kein Muxer,
+/// kein Output — nur der Fähigkeits-Test.
+fn probe_open(desc: ffmpeg::Codec, hwctx: &HwContext, vendor: Vendor) -> bool {
+    let Ok(mut enc) = codec::context::Context::new_with_codec(desc)
+        .encoder()
+        .video()
+    else {
+        return false;
+    };
+    enc.set_width(PROBE_W);
+    enc.set_height(PROBE_H);
+    enc.set_format(hwctx.ffmpeg_pixel());
+    enc.set_time_base(Rational::new(1, 30));
+    enc.set_frame_rate(Some(Rational::new(30, 1)));
+    enc.set_bit_rate(2_000_000);
+    unsafe {
+        let ctx = enc.as_mut_ptr();
+        let new_ref = av_buffer_ref(hwctx.frames_ref());
+        if new_ref.is_null() {
+            return false;
+        }
+        (*ctx).hw_frames_ctx = new_ref;
+    }
+    enc.open_with(opts::vendor_opts(vendor)).is_ok()
+}
+
 /// Output-Format-Hint nach URL-Schema: rtmp(s)→flv, srt→mpegts, sonst None
 /// (Datei → auto-detect anhand Erweiterung). Wie mac/win.
 pub fn url_format_hint(url: &str) -> Option<&'static str> {
