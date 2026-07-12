@@ -398,8 +398,12 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         uptime_s: 0.0,
     });
 
-    let (vendor, render_node) =
-        drm::detect().ok_or_else(|| anyhow!("keine DRM-Render-Node gefunden"))?;
+    // detect() liefert die Default-GPU (dGPU-bevorzugt bzw. PULSE_HQ_VENDOR).
+    // Die tatsächliche Encode-GPU wird erst nach dem ersten Frame bestimmt
+    // (Multi-GPU: der Compositor kann den Monitor auf einer anderen Karte halten).
+    let orig_vendor = drm::detect()
+        .map(|(v, _)| v)
+        .ok_or_else(|| anyhow!("keine DRM-Render-Node gefunden"))?;
 
     // 1) Portal-Dialog: User wählt Monitor/Fenster. Blockt bis zur Auswahl.
     emit(Event::Log {
@@ -447,38 +451,103 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         });
     }
 
-    // 4) Vendor-spezifischen Importer bauen. NVENC: BGR0-HW-Pool + CUDA-Interop.
-    //    VAAPI: DRM_PRIME→scale_vaapi-Filtergraph (NV12-Ausgang).
-    let mut importer = match vendor {
-        Vendor::Nvidia => {
-            // RGB0 (nicht BGR0): der GL-Blit im Importer kopiert komponenten-
-            // weise BGRx→RGBA8, die Staging-Bytes liegen danach als R,G,B,X.
-            let hw_ctx = hw::HwContext::create(
-                hw::HwDeviceKind::Cuda,
-                None,
-                out_w,
-                out_h,
-                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGB0,
-            )?;
-            let imp = NvDmabufImporter::new(out_w, out_h)?;
-            FrameImporter::Nvenc { imp, hw: hw_ctx }
+    // 4+6) Importer auf der GPU wählen, die den aufgenommenen Buffer BESITZT.
+    //    detect() bevorzugt blind die dGPU; auf Multi-GPU (dGPU + iGPU) kann der
+    //    Compositor den Monitor aber auf der anderen Karte halten, und ein
+    //    LINEAR-Modifier (0x0) verrät den Besitzer NICHT. Also: den ersten Frame
+    //    der Reihe nach auf jeder Kandidaten-GPU importieren — wer ihn nehmen
+    //    kann, besitzt ihn (Cross-GPU-Import scheitert sonst mit
+    //    glEGLImageTargetTexture2DOES 0x0502 bzw. VAAPI-hwmap). Reihenfolge:
+    //    Modifier-Hinweis (falls getilt), detect-Default, übrige Karten. Ein
+    //    explizites PULSE_HQ_VENDOR erlaubt keine Ausweichkarte.
+    let candidates: Vec<Vendor> = if std::env::var_os("PULSE_HQ_VENDOR").is_some() {
+        vec![orig_vendor]
+    } else {
+        // Reihenfolge: Modifier-Hinweis (falls getilt), detect-Default, übrige
+        // Karten — dedupliziert unter Beibehaltung der ersten Position.
+        let mut c = Vec::new();
+        for v in drm::vendor_from_modifier(first.modifier)
+            .into_iter()
+            .chain(std::iter::once(orig_vendor))
+            .chain(drm::present_vendors())
+        {
+            if !c.contains(&v) {
+                c.push(v);
+            }
         }
-        Vendor::Amd | Vendor::Intel => {
-            emit(Event::Log {
-                line: "[stream] VAAPI-Capture-Pfad (AMD/Intel)".to_string(),
-            });
-            let imp = VaapiImporter::new(
-                &render_node,
-                first.drm_fourcc,
-                width,
-                height,
-                params.fps,
-                out_w,
-                out_h,
-            )?;
-            FrameImporter::Vaapi { imp }
+        c
+    };
+
+    let build_importer = |cand: Vendor, node: &str| -> Result<FrameImporter> {
+        match cand {
+            Vendor::Nvidia => {
+                // RGB0 (nicht BGR0): der GL-Blit kopiert komponentenweise
+                // BGRx→RGBA8, die Staging-Bytes liegen danach als R,G,B,X.
+                let hw_ctx = hw::HwContext::create(
+                    hw::HwDeviceKind::Cuda,
+                    None,
+                    out_w,
+                    out_h,
+                    ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGB0,
+                )?;
+                let imp = NvDmabufImporter::new(out_w, out_h)?;
+                Ok(FrameImporter::Nvenc { imp, hw: hw_ctx })
+            }
+            Vendor::Amd | Vendor::Intel => {
+                let imp = VaapiImporter::new(
+                    node,
+                    first.drm_fourcc,
+                    width,
+                    height,
+                    params.fps,
+                    out_w,
+                    out_h,
+                )?;
+                Ok(FrameImporter::Vaapi { imp })
+            }
         }
     };
+
+    let mut chosen: Option<(Vendor, FrameImporter, *mut ffmpeg::ffi::AVFrame)> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for cand in candidates {
+        let node = drm::render_node_for(cand).unwrap_or_default();
+        match build_importer(cand, &node).and_then(|mut imp| {
+            let frame = imp.import(&first)?;
+            Ok((imp, frame))
+        }) {
+            Ok((imp, frame)) => {
+                chosen = Some((cand, imp, frame));
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "stream", vendor = cand.slug(),
+                    "GPU-Import fehlgeschlagen, nächste Karte: {e:#}"
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    let (vendor, mut importer, mut last_hw) = chosen.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow!("kein GPU-Importer für den aufgenommenen Buffer"))
+    })?;
+    close_planes(&first);
+    emit(Event::Log {
+        line: format!(
+            "[stream] Encode-Pfad: {}",
+            if matches!(vendor, Vendor::Nvidia) { "NVENC" } else { "VAAPI" }
+        ),
+    });
+    if vendor != orig_vendor {
+        emit(Event::Log {
+            line: format!(
+                "[stream] Encode-GPU auf {} umgestellt (Aufnahme liegt nicht auf Default-GPU {})",
+                vendor.slug(),
+                orig_vendor.slug()
+            ),
+        });
+    }
 
     // 5) Encoder mit dem vom Importer vorgegebenen HW-Pixel + Frames-Kontext.
     let (hw_pixel, frames_ctx) = importer.encoder_binding();
@@ -496,10 +565,6 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     });
     let (mut enc, audio_enc) =
         VideoEncoder::create_with_audio(&cfg, hw_pixel, frames_ctx, &params.push_url, audio_params)?;
-
-    // 6) Ersten Frame importieren → last_hw ist die Duplikationsquelle.
-    let mut last_hw: *mut ffmpeg::ffi::AVFrame = importer.import(&first)?;
-    close_planes(&first);
 
     // 7) GEMEINSAMER Zeit-Nullpunkt für Video UND Audio (GSR-Modell): beide
     //    Spuren leiten ihre pts aus DERSELBEN Monotonic-Uhr ab → kein Drift,

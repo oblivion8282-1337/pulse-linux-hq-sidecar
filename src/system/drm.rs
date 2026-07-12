@@ -144,3 +144,36 @@ pub fn render_node_for(vendor: Vendor) -> Option<String> {
         .find(|n| n.vendor == vendor)
         .map(|n| n.path.to_string_lossy().to_string())
 }
+
+/// Alle auf dieser Maschine anwesenden GPU-Vendors (distinct), dGPU vor iGPU.
+/// Für den Multi-GPU-Fallback: den ersten aufgenommenen Frame der Reihe nach auf
+/// jeder Karte zu importieren versuchen, bis eine ihn besitzt.
+pub fn present_vendors() -> Vec<Vendor> {
+    let nodes = enumerate_render_nodes();
+    let mut out = Vec::new();
+    for want in [Vendor::Nvidia, Vendor::Amd, Vendor::Intel] {
+        if nodes.iter().any(|n| n.vendor == want) {
+            out.push(want);
+        }
+    }
+    out
+}
+
+/// Hersteller der GPU, die einen aufgenommenen DMABUF getilt hat — aus dem
+/// DRM-Format-Modifier. Dessen oberste 8 Bit (56..63) sind der Vendor-Code
+/// (`DRM_FORMAT_MOD_VENDOR_*`): 1=Intel, 2=AMD, 3=NVIDIA. `LINEAR` (0) und
+/// `INVALID` (Top-Byte 0) tragen keine Vendor-Info → `None`.
+///
+/// Auf Multi-GPU-Systemen (dGPU + iGPU) rendert der Compositor den Monitor
+/// evtl. auf einer ANDEREN Karte als der default-bevorzugten dGPU. Der Encode-
+/// Pfad MUSS dann auf die Karte, die den Frame besitzt — sonst scheitert der
+/// Cross-Vendor-DMABUF-Import (`glEGLImageTargetTexture2DOES` / VAAPI-hwmap →
+/// GL_INVALID_OPERATION). Dieser Wert erlaubt genau diese Korrektur.
+pub fn vendor_from_modifier(modifier: u64) -> Option<Vendor> {
+    match modifier >> 56 {
+        1 => Some(Vendor::Intel),
+        2 => Some(Vendor::Amd),
+        3 => Some(Vendor::Nvidia),
+        _ => None,
+    }
+}
