@@ -35,7 +35,10 @@ main.rs, profiles.rs, encode/mux_writer.rs, ops/{list_profiles,stop,state}.rs`.
   Codecs **nur H264 + AV1** (kein HEVC — nicht anbieten, nicht proben, keine hevc_mux-Tests).
 - **Screen-Picker (Portal/PipeWire-Capture) wird zuletzt gebaut** — zuerst Pipeline mit
   synthetischer Quelle (`capture::SyntheticSource`) zum Laufen bringen.
-- **WHIP out-of-scope** (RTMPS→MediaMTX→WHEP wie win/mac).
+- **WHIP ist IN scope** (Kehrtwende 2026-07-12, User-Entscheid): `http(s)://`-push_url
+  → ffmpeg-8.1-WHIP-Muxer (WebRTC-Ingest für Gäste auf App-gehosteten Instanzen;
+  RTMPS bleibt Default/Cloud-Pfad). AV1 kann der WHIP-Muxer nicht → auto-Fallback
+  auf H.264 in `ops/start.rs`. Plan: pulse-Repo `docs/plans/2026-07-12-whip-guest-publish.md`.
 - Encoder-Settings orientieren sich an GSR (`~/.cache/pulse/gsr/gpu-screen-recorder/src/main.cpp`):
   NVENC `tune=ll/rc=cbr/b_ref_mode=0/coder=cabac`, VAAPI `rc_mode=CBR/async_depth=3/coder=cabac`.
   GSR nutzt selbst ffmpeg-Encoder (`h264_nvenc`/`h264_vaapi`) via av_dict — Settings ~1:1.

@@ -85,9 +85,16 @@ impl VideoEncoder {
         let mut output = match url_format_hint(output_path) {
             Some(fmt) => {
                 let mut o = Dictionary::new();
-                o.set("rw_timeout", "10000000"); // 10s — sonst blockt ein toter Socket ewig
-                if output_path.to_ascii_lowercase().starts_with("rtmps://") {
-                    o.set("tls_verify", "0"); // self-signed MediaMTX (GnuTLS honoriert das)
+                if fmt == "whip" {
+                    // Der WHIP-Muxer macht sein eigenes I/O (ICE/DTLS/SRTP) —
+                    // rw_timeout/tls_verify sind AVIO-Optionen und greifen hier
+                    // nicht. handshake_timeout (5s Default) begrenzt den Aufbau.
+                    o.set("handshake_timeout", "10000");
+                } else {
+                    o.set("rw_timeout", "10000000"); // 10s — sonst blockt ein toter Socket ewig
+                    if output_path.to_ascii_lowercase().starts_with("rtmps://") {
+                        o.set("tls_verify", "0"); // self-signed MediaMTX (GnuTLS honoriert das)
+                    }
                 }
                 format::output_as_with(output_path, fmt, o)
                     .with_context(|| format!("format::output_as_with({output_path}, {fmt})"))?
@@ -289,15 +296,50 @@ fn probe_open(desc: ffmpeg::Codec, hwctx: &HwContext, vendor: Vendor) -> bool {
     enc.open_with(opts::vendor_opts(vendor)).is_ok()
 }
 
-/// Output-Format-Hint nach URL-Schema: rtmp(s)→flv, srt→mpegts, sonst None
-/// (Datei → auto-detect anhand Erweiterung). Wie mac/win.
+/// Output-Format-Hint nach URL-Schema: rtmp(s)→flv, srt→mpegts,
+/// http(s)→whip (WebRTC-Ingest, Gäste-Publish auf App-gehosteten Instanzen —
+/// media-svc mintet dort `https://<host>/whep/<path>/whip?token=…`), sonst None
+/// (Datei → auto-detect anhand Erweiterung). Wie mac/win (+WHIP nur Linux).
 pub fn url_format_hint(url: &str) -> Option<&'static str> {
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("rtmp://") || lower.starts_with("rtmps://") {
         Some("flv")
     } else if lower.starts_with("srt://") {
         Some("mpegts")
+    } else if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some("whip")
     } else {
         None
+    }
+}
+
+/// Ist die Push-URL ein WHIP-Ziel? (Für den AV1→H.264-Fallback in `ops::start` —
+/// der ffmpeg-8.1-WHIP-Muxer kann kein AV1.)
+pub fn is_whip_url(url: &str) -> bool {
+    url_format_hint(url) == Some("whip")
+}
+
+#[cfg(test)]
+mod format_hint_tests {
+    use super::{is_whip_url, url_format_hint};
+
+    #[test]
+    fn hints_by_scheme() {
+        assert_eq!(url_format_hint("rtmp://h:1935/x"), Some("flv"));
+        assert_eq!(url_format_hint("RTMPS://h:1936/x?user=pulse&pass=t"), Some("flv"));
+        assert_eq!(url_format_hint("srt://h:8890?streamid=publish:x"), Some("mpegts"));
+        assert_eq!(url_format_hint("http://127.0.0.1:8889/channel-1/whip"), Some("whip"));
+        assert_eq!(
+            url_format_hint("https://host/whep/channel-1-2-abc/whip?token=t"),
+            Some("whip")
+        );
+        assert_eq!(url_format_hint("/tmp/out.mp4"), None);
+    }
+
+    #[test]
+    fn whip_detection() {
+        assert!(is_whip_url("https://host/whep/channel-1/whip?token=t"));
+        assert!(!is_whip_url("rtmps://host:1936/channel-1?user=pulse&pass=t"));
+        assert!(!is_whip_url("/tmp/out.mp4"));
     }
 }

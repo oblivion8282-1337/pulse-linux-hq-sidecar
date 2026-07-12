@@ -39,7 +39,7 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            anyhow!("channel.push_url ist Pflicht (media-svc reicht die rtmps://-URL durch)")
+            anyhow!("channel.push_url ist Pflicht (media-svc reicht die rtmps://- bzw. WHIP-URL durch)")
         })?;
 
     let overrides = params.get("overrides").and_then(Value::as_object);
@@ -48,13 +48,16 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         .and_then(Value::as_str)
         .unwrap_or(profile.codec)
         .to_string();
-    // Sicherheitsnetz: kann die HW den gewählten Codec nicht encodieren, auf
-    // H.264 zurückfallen statt den Encoder-open crashen zu lassen. Die UI bietet
-    // AV1 auf solcher HW zwar gar nicht erst an (list_profiles filtert über
-    // dieselbe Probe), aber ein veralteter Client / Direktaufruf käme sonst zum
-    // harten Fehler. Geht auch H.264 nicht, bleibt der Wunsch stehen → echter,
-    // ehrlicher Encoder-Fehler.
-    let codec = if crate::caps::supports_codec(&requested_codec) {
+    // Codec-Wahl mit zwei Sicherheitsnetzen, Reihenfolge fest:
+    // 1. Kann die HW den gewünschten Codec nicht encodieren, auf H.264 zurück-
+    //    fallen statt den Encoder-open crashen zu lassen. Die UI bietet AV1 auf
+    //    solcher HW zwar gar nicht erst an (list_profiles filtert über dieselbe
+    //    Probe), aber ein veralteter Client / Direktaufruf käme sonst zum harten
+    //    Fehler. Geht auch H.264 nicht, bleibt der Wunsch stehen → echter,
+    //    ehrlicher Encoder-Fehler.
+    // 2. WHIP-Ziel (App-gehostete Instanz): der ffmpeg-8.1-WHIP-Muxer kann kein
+    //    AV1 → auf H.264 ausweichen statt beim write_header hart zu scheitern.
+    let mut codec = if crate::caps::supports_codec(&requested_codec) {
         requested_codec
     } else if crate::caps::supports_codec("h264") {
         tracing::warn!(
@@ -65,6 +68,13 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
     } else {
         requested_codec
     };
+    if codec == "av1" && crate::encode::is_whip_url(&push_url) {
+        tracing::warn!(
+            target: "stream",
+            "AV1 über WHIP nicht verfügbar (ffmpeg-Muxer) → Fallback auf h264"
+        );
+        codec = "h264".to_string();
+    }
     let fps = overrides
         .and_then(|o| o.get("fps"))
         .and_then(Value::as_u64)
