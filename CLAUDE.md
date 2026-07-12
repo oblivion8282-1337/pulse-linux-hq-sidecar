@@ -69,9 +69,10 @@ API :9997, HLS :8888). Self-signed Cert: `openssl req -x509 -newkey rsa:2048 -no
 **`test/certs/` ist gitignored — Private Keys niemals committen.**
 
 ## Dev-Umgebung
-- **NVIDIA RTX 4090 (Ada)**, niri (Wayland), PipeWire 1.6.7. NVENC-Pfad live testbar
-  (H264+AV1). **VAAPI-Pfad nicht runtime-testbar** hier (keine AMD/Intel-dGPU) — nur per
-  Analogie implementiert.
+- **NVIDIA RTX 4090 (Ada)** + **AMD Raphael-iGPU** (renderD129, im BIOS scharf), niri
+  (Wayland), PipeWire 1.6.7. Beide Encode-Pfade live testbar: NVENC (H264+AV1),
+  VAAPI (H264). AMD-Test erzwingen: `PULSE_HQ_VENDOR=amd` + im Portal den Monitor am
+  iGPU-/Mainboard-Ausgang wählen (nur dessen Bild liegt in AMD-Speicher).
 - xdg-desktop-Portal ScreenCast nutzt hier den **GNOME-Backend** (niri implementiert
   `org.gnome.Mutter.ScreenCast`); konfiguriert in `~/.config/xdg-desktop-portal/portals.conf`.
 - libclang liegt als `/usr/lib/libclang.so` (kein pkg-config-File, aber bindgen findet es).
@@ -117,16 +118,19 @@ Live verifiziert: `start` mit `audio.mode!="Aus"`, MediaMTX-API zeigt `tracks
 parst er nicht; MediaMTX als echter Konsument sieht beide.) A/V-Anchoring noch offen
 (`av_offset_ms` wird geloggt, nicht angewandt; Audio-pts startet bei 0 wie Video).
 
-**VAAPI-Import implementiert (AMD/Intel) — NICHT auf Hardware getestet** (`src/encode/
+**VAAPI-Import (AMD/Intel) — auf AMD-Hardware verifiziert** (`src/encode/
 va_import.rs`): DMABUF → `AV_PIX_FMT_DRM_PRIME`-Frame (aus `AVDRMFrameDescriptor`) →
 Filtergraph `buffer → hwmap=derive_device=vaapi → scale_vaapi=format=nv12 → buffersink`.
 `hwmap` importiert das DMABUF zero-copy in eine VAAPI-Surface, `scale_vaapi` (VPP) macht
 BGRx→NV12 auf der GPU. Der Encoder bindet den NV12-Buffersink-Frames-Kontext. Nötig:
 ffmpeg-next-Feature `filter`. `VideoEncoder::create_with_audio` nimmt jetzt
 `(hw_pixel, frames_ctx)` statt `&HwContext` (entkoppelt NVENC/VAAPI). `run_stream`
-verzweigt über ein `FrameImporter`-Enum (Nvenc/Vaapi). Bruchstellen mit `// UNVERIFIED`
-markiert (DRM-hwframe-init, Deskriptor-`size`, hwmap-derive). NVIDIA-Regression nach dem
-Umbau OK (tracks H264+Opus, 60 fps, bytes steigen).
+verzweigt über ein `FrameImporter`-Enum (Nvenc/Vaapi). **Kern-Falle (gelöst): der
+DRM_PRIME-Eingabe-Frame MUSS referenzgezählt sein (`frame->buf[0]` gesetzt, Deskriptor
+heap-alloziert + `av_buffer_create`)** — sonst deep-kopiert buffersrc via
+`av_hwframe_get_buffer`, was der DRM-Kontext nicht kann → `AVERROR(ENOMEM)`=-12 beim
+ersten Frame (ohne jede VAAPI-Logzeile). NVIDIA-Regression nach dem Umbau OK
+(tracks H264+Opus, 60 fps, bytes steigen).
 
 **`test_driver`-Example** (`examples/test_driver.rs`, portiert aus win-hq-sidecar):
 spawnt das Binary, redet JSON-RPC über stdin/stdout, tee't zeitgestempelt in

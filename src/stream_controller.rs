@@ -465,7 +465,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         }
         Vendor::Amd | Vendor::Intel => {
             emit(Event::Log {
-                line: "[stream] VAAPI-Capture-Pfad (AMD/Intel) — auf dieser Hardware nicht getestet".to_string(),
+                line: "[stream] VAAPI-Capture-Pfad (AMD/Intel)".to_string(),
             });
             let imp = VaapiImporter::new(
                 &render_node,

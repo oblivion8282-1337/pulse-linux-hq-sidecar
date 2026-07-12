@@ -1,9 +1,7 @@
 //! Zero-Copy-Import: DMABUF (PipeWire-Capture) → VAAPI-NV12-Frame (AMD/Intel).
 //!
-//! **ACHTUNG — bisher NICHT auf echter Hardware getestet.** Die Dev-Maschine
-//! ist NVIDIA-only; dieser Pfad ist streng nach FFmpeg-Konventionen + GSR/OBS
-//! nachgebaut und nur compile-verifiziert. Wahrscheinliche Bruchstellen sind
-//! unten mit `// UNVERIFIED` markiert.
+//! Auf echter AMD-Hardware verifiziert (Raphael-iGPU, radeonsi/VAAPI,
+//! `PULSE_HQ_VENDOR=amd`): H.264-Stream läuft, kein CPU-Roundtrip.
 //!
 //! Anders als der NVENC-Pfad (CUDA-Interop, `nv_import.rs`) läuft hier alles
 //! über FFmpegs eigene Filter/HW-Frames-Maschinerie — kein EGL/GL:
@@ -98,9 +96,10 @@ impl VaapiImporter {
     unsafe fn build_graph(&mut self, fps: u32, out_w: u32, out_h: u32) -> Result<()> {
         unsafe {
             // 2) DRM-Frames-Kontext (Vorlage für die DRM_PRIME-Eingabe-Frames).
-            //    UNVERIFIED: DRM-hwframe-init ist laut FFmpeg-Doku eingeschränkt
-            //    ("internal allocation not supported") — wir liefern die Frames
-            //    selbst, der Kontext beschreibt nur Format/Maße.
+            //    DRM-hwframe-init kann nicht selbst allozieren ("internal
+            //    allocation not supported") — wir liefern die Frames selbst
+            //    (referenzgezählt, s. import()), der Kontext beschreibt nur
+            //    Format/Maße.
             let drm_frames = av_hwframe_ctx_alloc(self.drm_dev);
             if drm_frames.is_null() {
                 return Err(anyhow!("av_hwframe_ctx_alloc(DRM) returned NULL"));
@@ -257,16 +256,38 @@ impl VaapiImporter {
                 desc.layers[0].planes[i].pitch = p.stride as isize;
             }
 
-            // DRM_PRIME-Eingabe-Frame. data[0] zeigt auf den Deskriptor (muss bis
-            // add_frame leben — tut er, gleicher Scope).
+            // DRM_PRIME-Eingabe-Frame. Der Deskriptor MUSS referenzgezählt über
+            // frame->buf[0] hängen: buffersrc prüft `refcounted = !!frame->buf[0]`
+            // und deep-kopiert nicht-refcounted Frames via av_frame_ref →
+            // av_hwframe_get_buffer. Der DRM-Frames-Kontext kann aber nicht selbst
+            // allozieren ("internal allocation not supported") → AVERROR(ENOMEM)=-12
+            // (genau der Fehler, ohne jede hwmap/VAAPI-Logzeile). Mit gesetztem
+            // buf[0] macht buffersrc stattdessen av_frame_move_ref (kein Kopierversuch).
+            let desc_size = std::mem::size_of::<AVDRMFrameDescriptor>();
+            let desc_heap = av_malloc(desc_size) as *mut AVDRMFrameDescriptor;
+            if desc_heap.is_null() {
+                return Err(anyhow!("av_malloc(AVDRMFrameDescriptor) returned NULL"));
+            }
+            ptr::write(desc_heap, desc);
+            // free=None → av_buffer_default_free → av_free (passt zu av_malloc).
+            // Gibt nur den Deskriptor-Speicher frei, schließt KEINE fds.
+            let mut desc_buf =
+                av_buffer_create(desc_heap as *mut u8, desc_size, None, ptr::null_mut(), 0);
+            if desc_buf.is_null() {
+                av_free(desc_heap as *mut std::ffi::c_void);
+                return Err(anyhow!("av_buffer_create(desc) returned NULL"));
+            }
+
             let mut src = av_frame_alloc();
             if src.is_null() {
+                av_buffer_unref(&mut desc_buf);
                 return Err(anyhow!("av_frame_alloc(src) returned NULL"));
             }
             (*src).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             (*src).width = self.width as i32;
             (*src).height = self.height as i32;
-            (*src).data[0] = &mut desc as *mut AVDRMFrameDescriptor as *mut u8;
+            (*src).data[0] = desc_heap as *mut u8;
+            (*src).buf[0] = desc_buf; // move_ref überträgt den Besitz in den Graph
             (*src).hw_frames_ctx = av_buffer_ref(self.drm_frames);
 
             let r = av_buffersrc_add_frame_flags(self.src_ctx, src, AV_BUFFERSRC_FLAG_PUSH);
