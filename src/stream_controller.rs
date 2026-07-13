@@ -529,9 +529,15 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             }
         }
     }
-    let (vendor, mut importer, mut last_hw) = chosen.ok_or_else(|| {
-        last_err.unwrap_or_else(|| anyhow!("kein GPU-Importer für den aufgenommenen Buffer"))
-    })?;
+    // close_planes auch im Fehlerfall — sonst leaken die DMABUF-fds des ersten
+    // Frames und halten GPU-Puffer fest (schlimm genau dann, wenn die GPU eh
+    // schon in Speichernot ist und der User mehrfach neu startet).
+    let Some((vendor, mut importer, mut last_hw)) = chosen else {
+        close_planes(&first);
+        return Err(
+            last_err.unwrap_or_else(|| anyhow!("kein GPU-Importer für den aufgenommenen Buffer"))
+        );
+    };
     close_planes(&first);
     emit(Event::Log {
         line: format!(
