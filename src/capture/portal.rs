@@ -17,8 +17,9 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
-use ashpd::desktop::PersistMode;
+use ashpd::desktop::{PersistMode, Session};
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 
 /// Exit-Code bei User-Abbruch des Portal-Dialogs (GSR-Konvention).
 pub const EXIT_PORTAL_CANCELED: i32 = 60;
@@ -56,13 +57,23 @@ pub struct PortalSession {
     /// Restore-Token für PersistMode (Wiederverwendung ohne Dialog beim
     /// nächsten Start). Noch nicht persistiert — kommt mit dem Settings-Store.
     pub restore_token: Option<String>,
+    /// Schließt die Portal-Session beim Drop (Stream-Ende ODER Fehlerpfad).
+    /// Ohne explizites `Close` bleibt die Session im Compositor registriert,
+    /// solange der Sidecar-Prozess lebt (die zbus-Verbindung ist prozessweit
+    /// gecacht) — KDE zeigt dann dauerhaft das rote „Bildschirm wird
+    /// aufgenommen"-Tray-Symbol, eines pro geleakter Session. GSR hat das
+    /// Problem nicht, weil dort der Prozess pro Aufnahme endet.
+    _close_guard: SessionCloseGuard,
 }
+
+/// Hält den oneshot-Sender; sein Drop weckt den Close-Task im portal_runtime.
+struct SessionCloseGuard(#[allow(dead_code)] oneshot::Sender<()>);
 
 /// Verhandle eine ScreenCast-Session. Öffnet den Portal-Dialog (User wählt
 /// Quelle). `show_cursor=true` → Cursor eingebettet (Embedded), sonst Hidden.
 pub fn open(show_cursor: bool) -> Result<PortalSession> {
     portal_runtime().block_on(async move {
-        let sc = Screencast::new()
+        let sc: Screencast<'static> = Screencast::new()
             .await
             .map_err(|e| anyhow!("Screencast::new: {e}"))?;
         let session = sc
@@ -70,54 +81,88 @@ pub fn open(show_cursor: bool) -> Result<PortalSession> {
             .await
             .map_err(|e| anyhow!("create_session: {e}"))?;
 
-        let cursor = if show_cursor {
-            CursorMode::Embedded
-        } else {
-            CursorMode::Hidden
-        };
-        // Monitor ODER Window zur Auswahl anbieten.
-        let types = SourceType::Monitor | SourceType::Window;
-        sc.select_sources(
-            &session,
-            cursor,
-            types,
-            false, // multiple — einzelne Quelle
-            None,  // restore_token (noch nicht persistiert)
-            PersistMode::ExplicitlyRevoked,
-        )
-        .await
-        .map_err(|e| anyhow!("select_sources: {e}"))?
-        .response()
-        .map_err(|e| cancel_or_err("select_sources", e))?;
-
-        let streams = sc
-            .start(&session, None)
-            .await
-            .map_err(|e| anyhow!("start: {e}"))?
-            .response()
-            .map_err(|e| cancel_or_err("start", e))?;
-
-        let fd = sc
-            .open_pipe_wire_remote(&session)
-            .await
-            .map_err(|e| anyhow!("open_pipe_wire_remote: {e}"))?;
-
-        let first = streams
-            .streams()
-            .first()
-            .ok_or_else(|| anyhow!("Start lieferte keine Streams (User-Abbruch?)"))?;
-        let node_id = first.pipe_wire_node_id();
-        let (w, h) = first.size().unwrap_or((0, 0));
-        let restore_token = streams.restore_token().map(str::to_string);
-
-        Ok(PortalSession {
-            pw_fd: fd,
-            node_id,
-            width: w as u32,
-            height: h as u32,
-            restore_token,
-        })
+        match negotiate(&sc, &session, show_cursor).await {
+            Ok((pw_fd, node_id, width, height, restore_token)) => {
+                // Close-Task: lebt auf dem portal_runtime und wartet, bis der
+                // Guard (Sender) im PortalSession-Drop fällt — dann Session
+                // explizit schließen, damit der Compositor die Aufnahme-Anzeige
+                // beendet. Fehler beim Close sind egal (Session evtl. schon weg).
+                let (close_tx, close_rx) = oneshot::channel::<()>();
+                tokio::spawn(async move {
+                    let _ = close_rx.await;
+                    if let Err(e) = session.close().await {
+                        tracing::debug!(target: "stream", "portal session close: {e}");
+                    }
+                    drop(sc);
+                });
+                Ok(PortalSession {
+                    pw_fd,
+                    node_id,
+                    width,
+                    height,
+                    restore_token,
+                    _close_guard: SessionCloseGuard(close_tx),
+                })
+            }
+            Err(e) => {
+                // Fehlgeschlagene/abgebrochene Verhandlung: Session sofort
+                // schließen, sonst bleibt sie als Leiche im Compositor.
+                let _ = session.close().await;
+                Err(e)
+            }
+        }
     })
+}
+
+/// Die eigentliche Verhandlung (SelectSources → Start → OpenPipeWireRemote),
+/// getrennt von `open()`, damit der Fehlerpfad dort die Session schließen kann.
+/// Liefert (pw_fd, node_id, width, height, restore_token).
+async fn negotiate(
+    sc: &Screencast<'static>,
+    session: &Session<'static, Screencast<'static>>,
+    show_cursor: bool,
+) -> Result<(OwnedFd, u32, u32, u32, Option<String>)> {
+    let cursor = if show_cursor {
+        CursorMode::Embedded
+    } else {
+        CursorMode::Hidden
+    };
+    // Monitor ODER Window zur Auswahl anbieten.
+    let types = SourceType::Monitor | SourceType::Window;
+    sc.select_sources(
+        session,
+        cursor,
+        types,
+        false, // multiple — einzelne Quelle
+        None,  // restore_token (noch nicht persistiert)
+        PersistMode::ExplicitlyRevoked,
+    )
+    .await
+    .map_err(|e| anyhow!("select_sources: {e}"))?
+    .response()
+    .map_err(|e| cancel_or_err("select_sources", e))?;
+
+    let streams = sc
+        .start(session, None)
+        .await
+        .map_err(|e| anyhow!("start: {e}"))?
+        .response()
+        .map_err(|e| cancel_or_err("start", e))?;
+
+    let fd = sc
+        .open_pipe_wire_remote(session)
+        .await
+        .map_err(|e| anyhow!("open_pipe_wire_remote: {e}"))?;
+
+    let first = streams
+        .streams()
+        .first()
+        .ok_or_else(|| anyhow!("Start lieferte keine Streams (User-Abbruch?)"))?;
+    let node_id = first.pipe_wire_node_id();
+    let (w, h) = first.size().unwrap_or((0, 0));
+    let restore_token = streams.restore_token().map(str::to_string);
+
+    Ok((fd, node_id, w as u32, h as u32, restore_token))
 }
 
 /// ashpd meldet einen User-Abbruch als Error — wir wandeln das in einen
