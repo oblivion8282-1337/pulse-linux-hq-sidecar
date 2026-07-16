@@ -204,16 +204,25 @@ fn ensure_links(core: &CoreRc, st: &mut State, mode: &RouteMode) {
         .collect();
 
     for (nid, ports) in candidates {
-        // Mono-Quelle (ein Port oder Kanal MONO) → auf BEIDE Sink-Kanäle.
+        // SOLL-Linksatz dieses Nodes aus dem AKTUELLEN Port-Stand berechnen und
+        // dann abgleichen (anlegen + überzählige entfernen). Wichtig, weil
+        // PipeWire die Ports eines Stereo-Streams EINZELN meldet und wir nach
+        // jedem Registry-Event laufen: Beim ersten Event sieht der Node wie
+        // Mono aus (ein Port) → der Port wurde auf BEIDE Sink-Kanäle gelinkt;
+        // der Link blieb nach Eintreffen des zweiten Ports kleben → der zweite
+        // Sink-Kanal bekam die SUMME beider Kanäle (rechts doppelt so laut,
+        // bei Dual-Mono exakt +6 dB — 2026-07-16 am MoQ-Player gemessen; WHEP
+        // hatte es durch seinen Mono-Downmix verdeckt).
         let mono = ports.len() == 1;
-        for (port_id, channel) in ports {
+        let mut desired: Vec<(u32, u32)> = Vec::new();
+        for (port_id, channel) in &ports {
             let dests: Vec<u32> = if mono || channel == "MONO" {
                 st.sink_ports.iter().map(|&(_, id)| id).collect()
             } else {
                 let matched: Vec<u32> = st
                     .sink_ports
                     .iter()
-                    .filter(|(c, _)| *c == channel)
+                    .filter(|(c, _)| c == channel)
                     .map(|&(_, id)| id)
                     .collect();
                 if matched.is_empty() {
@@ -223,22 +232,38 @@ fn ensure_links(core: &CoreRc, st: &mut State, mode: &RouteMode) {
                     matched
                 }
             };
-            for dest in dests {
-                if st.links.contains_key(&(port_id, dest)) {
-                    continue;
+            desired.extend(dests.into_iter().map(|d| (*port_id, d)));
+        }
+
+        // Überzählige Links dieses Nodes lösen (Drop des Proxys löst den Link).
+        let node_ports: BTreeSet<u32> = ports.iter().map(|(id, _)| *id).collect();
+        let stale: Vec<(u32, u32)> = st
+            .links
+            .keys()
+            .filter(|(out_p, _)| node_ports.contains(out_p))
+            .filter(|pair| !desired.contains(pair))
+            .copied()
+            .collect();
+        for pair in stale {
+            st.links.remove(&pair);
+            tracing::info!(target: "audio", node = nid, "veralteten Audio-Link gelöst");
+        }
+
+        for (port_id, dest) in desired {
+            if st.links.contains_key(&(port_id, dest)) {
+                continue;
+            }
+            match create_link(core, nid, port_id, sink_node, dest) {
+                Ok(link) => {
+                    tracing::info!(
+                        target: "audio",
+                        node = nid,
+                        "App-Audio → Capture-Sink verbunden"
+                    );
+                    st.links.insert((port_id, dest), link);
                 }
-                match create_link(core, nid, port_id, sink_node, dest) {
-                    Ok(link) => {
-                        tracing::info!(
-                            target: "audio",
-                            node = nid,
-                            "App-Audio → Capture-Sink verbunden"
-                        );
-                        st.links.insert((port_id, dest), link);
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "audio", "Audio-Link erstellen: {e:#}");
-                    }
+                Err(e) => {
+                    tracing::warn!(target: "audio", "Audio-Link erstellen: {e:#}");
                 }
             }
         }
