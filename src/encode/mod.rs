@@ -57,8 +57,13 @@ impl VideoEncoder {
     /// `write_header` wird hier gerufen; danach geht jeder `write_interleaved`
     /// asynchron über den MuxWriter-Thread.
     pub fn create(cfg: &EncoderConfig, hw: &HwContext, output_path: &str) -> Result<Self> {
-        let (enc, _no_audio) =
-            Self::create_with_audio(cfg, hw.ffmpeg_pixel(), hw.frames_ref(), output_path, None)?;
+        // SAFETY: Pixelformat und Frames-Kontext kommen aus demselben
+        // `HwContext`, passen also zueinander; `hw` ist für den ganzen Aufruf
+        // geliehen, der Kontext überlebt damit `write_header`. Deshalb darf
+        // dieser Wrapper sicher sein.
+        let (enc, _no_audio) = unsafe {
+            Self::create_with_audio(cfg, hw.ffmpeg_pixel(), hw.frames_ref(), output_path, None)?
+        };
         Ok(enc)
     }
 
@@ -70,11 +75,16 @@ impl VideoEncoder {
     /// hinzugefügt; der zurückgegebene [`AudioEncoder`] läuft auf einem eigenen
     /// Thread und teilt sich den Muxer über [`VideoEncoder::mux_sender`].
     ///
-    /// SAFETY: `frames_ctx` muss ein gültiger `AVHWFramesContext`-`AVBufferRef`
-    /// sein, der `hw_pixel` entspricht, und mindestens bis `write_header` leben.
+    /// # Safety
+    ///
+    /// `frames_ctx` muss ein gültiger `AVHWFramesContext`-`AVBufferRef` sein,
+    /// der `hw_pixel` entspricht, und mindestens bis `write_header` leben. Die
+    /// Funktion dereferenziert den Zeiger (`av_buffer_ref` + Zuweisung an
+    /// `AVCodecContext::hw_frames_ctx`) — ein ungültiger oder zu früh
+    /// freigegebener Zeiger ist undefiniertes Verhalten.
     ///
     /// [`create`]: VideoEncoder::create
-    pub fn create_with_audio(
+    pub unsafe fn create_with_audio(
         cfg: &EncoderConfig,
         hw_pixel: format::Pixel,
         frames_ctx: *mut AVBufferRef,
@@ -211,7 +221,14 @@ impl VideoEncoder {
 
     /// Schicke einen HW-Frame (CUDA/VAAPI, `*mut AVFrame`) in den Encoder.
     /// `pts` in Encoder-Timebase (1/fps), strikt monoton.
-    pub fn send_hw(&mut self, frame: *mut AVFrame, pts: i64) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// `frame` muss ein gültiger, noch lebender `AVFrame` sein, dessen
+    /// HW-Format zu dem beim Öffnen gebundenen Frames-Kontext passt. Die
+    /// Funktion schreibt in den Frame (`pts`) und reicht ihn an
+    /// `avcodec_send_frame` weiter.
+    pub unsafe fn send_hw(&mut self, frame: *mut AVFrame, pts: i64) -> Result<()> {
         unsafe {
             (*frame).pts = pts;
             let mut ret = avcodec_send_frame(self.encoder.as_mut_ptr(), frame);

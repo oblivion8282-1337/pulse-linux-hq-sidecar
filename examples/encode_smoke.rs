@@ -93,7 +93,9 @@ fn main() -> anyhow::Result<()> {
         nv12.set_pts(Some(i as i64));
 
         let mut hw_frame = hw_ctx.upload_swframe(&nv12, i as i64)?;
-        enc.send_hw(hw_frame, i as i64)?;
+        // SAFETY: frisch von `upload_swframe` bzw. dem Capture-Pfad geliefert,
+        // noch nicht freigegeben, Format passt zum gebundenen Frames-Kontext.
+        unsafe { enc.send_hw(hw_frame, i as i64)? };
         unsafe { av_frame_free(&mut hw_frame) }; // freigeben nach send
 
         if live {

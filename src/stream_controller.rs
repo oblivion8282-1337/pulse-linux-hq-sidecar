@@ -730,8 +730,12 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     if shared.stop_requested.load(Ordering::SeqCst) {
         return Ok(None);
     }
-    let (mut enc, audio_enc) =
-        VideoEncoder::create_with_audio(&cfg, hw_pixel, frames_ctx, &params.push_url, audio_params)?;
+    // SAFETY: `frames_ctx` stammt aus dem oben aufgebauten HW-/Filter-Pfad und
+    // passt per Konstruktion zu `hw_pixel`; er lebt über den ganzen
+    // Encode-Lauf, also weit über `write_header` hinaus.
+    let (mut enc, audio_enc) = unsafe {
+        VideoEncoder::create_with_audio(&cfg, hw_pixel, frames_ctx, &params.push_url, audio_params)?
+    };
     if shared.stop_requested.load(Ordering::SeqCst) {
         return Ok(None);
     }
@@ -828,7 +832,11 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             next_pts = pts + 1;
 
             // Aktuelles (ggf. dupliziertes) Bild encodieren.
-            enc.send_hw(last_hw.raw(), pts)?;
+            // SAFETY: `last_hw` besitzt den zuletzt vom Capture-/Filter-Pfad
+            // gelieferten HW-Frame und hält ihn bis zum `drop` nach der
+            // Encode-Schleife am Leben; `raw()` liefert genau diesen Zeiger,
+            // dessen HW-Format zum gebundenen Frames-Kontext passt.
+            unsafe { enc.send_hw(last_hw.raw(), pts)? };
             window_frames += 1;
 
             if window_start.elapsed() >= Duration::from_secs(1) {
