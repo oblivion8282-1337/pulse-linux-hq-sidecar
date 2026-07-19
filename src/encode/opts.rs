@@ -34,7 +34,21 @@ pub fn vendor_opts(vendor: Vendor) -> Dictionary<'static> {
             opts.set("rc", "cbr");
             opts.set("b_ref_mode", "0");
             opts.set("coder", "cabac");
-            // preset/Multipass/rc-lookahead nur bei tune=quality (hier nicht).
+            // Hier stand mal: "preset/Multipass/rc-lookahead nur bei tune=quality".
+            // Das ist FALSCH — 2026-07-19 nachgemessen (RTX 4090, ffmpeg-nvenc):
+            // `preset`/`multipass`/`spatial-aq` werden auch mit tune=ll angenommen
+            // und verändern den Bitstrom nachweislich (andere Prüfsummen, keine
+            // "ignoring"-Warnung). `preset` ist hier schlicht ungesetzt und läuft
+            // damit auf dem ffmpeg-Default p4.
+            //
+            // Absichtlich trotzdem nicht gesetzt: der Gewinn ist zu klein. Auf
+            // echtem Bildschirmmaterial bei 4000 kbps bringt p6+multipass+AQ
+            // +0,85 VMAF, und selbst mit ALLEM (p7, B-Frames, 30 Bilder
+            // Lookahead) sind es nur +1,84 — unterhalb der Wahrnehmungsschwelle,
+            // während der Encode-Durchsatz um 40-50 % fällt (bei 4K60 damit
+            // grenzwertig). Bei 2000 kbps ist der Gewinn exakt null.
+            // Volle Messung: `docs/2026-07-19-hq-encoder-qualitaet-messung.md`
+            // im Hauptrepo. Nicht ohne neue Messung daran drehen.
         }
         Vendor::Amd | Vendor::Intel => {
             // GSR main.cpp: rc_mode="CBR", async_depth=3, low_power je Capability,
