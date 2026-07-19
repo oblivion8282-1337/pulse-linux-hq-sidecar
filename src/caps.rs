@@ -2,8 +2,9 @@
 //! encodieren kann (VAAPI für AMD/Intel, NVENC für Nvidia), über das gelinkte
 //! FFmpeg.
 //!
-//! Treibt `list_profiles` (der Renderer zeigt nur Codecs, die die HW kann) und
-//! den `health`/`gpu_info`-Report. Gate nach *Fähigkeit*, nie nach Modellname.
+//! Treibt den `health`/`gpu_info`-Report (der Renderer zeigt nur Codecs, die die
+//! HW kann) und den Codec-Rückfall in `start`. Gate nach *Fähigkeit*, nie nach
+//! Modellname.
 //!
 //! Echte Probe (`encode::probe_encoder`): pro Codec wird der Encoder mit einem
 //! HW-Frames-Kontext tatsächlich geöffnet. Nur was sich öffnen lässt, gilt als

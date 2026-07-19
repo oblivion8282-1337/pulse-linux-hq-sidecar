@@ -10,16 +10,12 @@
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 
-use crate::profiles::profile_by_name;
+use crate::profiles::{BASELINE, profile_label};
 use crate::redact::redact_url;
 
 pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
-    let profile_name = params
-        .get("profile")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("profile (Name) ist Pflicht"))?;
-    let profile = profile_by_name(profile_name)
-        .ok_or_else(|| anyhow!("Unknown stream profile: {profile_name}"))?;
+    let profile_name = profile_label(&params);
+    let profile = &BASELINE;
 
     let channel = params
         .get("channel")
@@ -59,7 +55,16 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         .and_then(Value::as_str)
         .unwrap_or("Aus");
 
-    let argv = build_argv(profile.name, codec, fps as u32, bitrate_kbps, resolution, capture, audio_mode, push_url);
+    let argv = build_argv(
+        profile_name,
+        codec,
+        fps as u32,
+        bitrate_kbps,
+        resolution,
+        capture,
+        audio_mode,
+        push_url,
+    );
 
     let mut out = Map::new();
     out.insert("binary".to_string(), Value::String("pulse-linux-hq-sidecar".to_string()));

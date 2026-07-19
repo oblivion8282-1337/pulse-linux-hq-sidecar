@@ -41,7 +41,6 @@ fn dispatch(req: Request) -> Response {
     let result: anyhow::Result<Map<String, Value>> = match req.op.as_str() {
         "health" => ops::health::handle(req.params),
         "gpu_info" => ops::gpu_info::handle(req.params),
-        "list_profiles" => ops::list_profiles::handle(req.params),
         "list_monitors" => ops::list_monitors::handle(req.params),
         "list_windows" => ops::list_windows::handle(req.params),
         "list_application_audio" => ops::list_application_audio::handle(req.params),
@@ -73,7 +72,9 @@ mod request_bytes_tests {
 
     #[test]
     fn valid_utf8_dispatches_normally() {
-        let resp = handle_request_bytes(b" {\"op\":\"list_profiles\",\"id\":7} \n");
+        // `state` als Beispiel-Op: nebenwirkungsfrei (liest nur den Controller-
+        // Snapshot), also unabhängig von Hardware und Reihenfolge im Testlauf.
+        let resp = handle_request_bytes(b" {\"op\":\"state\",\"id\":7} \n");
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["ok"], serde_json::Value::Bool(true));
         assert_eq!(v["id"], serde_json::json!(7));

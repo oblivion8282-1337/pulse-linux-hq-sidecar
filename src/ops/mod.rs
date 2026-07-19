@@ -8,7 +8,6 @@
 //! |------------------------|-----------------|-----------------------------------------|
 //! | health                 | static          | DRM-Vendor + VAAPI/NVENC-Codec-Probe    |
 //! | gpu_info               | stub            | DRM-Vendor + codec_query (vaapi/nvenc)  |
-//! | list_profiles          | real            | ported from profiles.py (H264+AV1)      |
 //! | list_monitors          | stub (`[]`)     | PipeWire/Portal-Display-Enumeration     |
 //! | list_windows           | stub (`[]`)     | wlr-foreign-toplevel / Portal           |
 //! | list_application_audio | stub (`[]`)     | PipeWire-Node-Enumeration                |
@@ -22,7 +21,6 @@ pub mod gpu_info;
 pub mod health;
 pub mod list_application_audio;
 pub mod list_monitors;
-pub mod list_profiles;
 pub mod list_windows;
 pub mod start;
 pub mod state;

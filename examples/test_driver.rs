@@ -19,8 +19,8 @@
 //!
 //! Szenarien:
 //! - `protocol` — sweep über ALLE nicht-interaktiven Ops (health, gpu_info,
-//!   list_profiles, list_monitors, list_windows, list_application_audio,
-//!   build_argv, state) + unknown-op + invalid-json. **Kein Portal-Dialog** —
+//!   list_monitors, list_windows, list_application_audio, build_argv, state)
+//!   + unknown-op + invalid-json. **Kein Portal-Dialog** —
 //!   der wiederholbare Wire-Protocol-Smoke.
 //! - `health` — nur `health` + Exit.
 //! - `video_only` — start mit audio=Aus. Erwartet `state=live` + ≥1 `fps`-Event
@@ -100,7 +100,6 @@ fn scenario_protocol(driver: &mut Driver, push_url: &str) -> anyhow::Result<()> 
     for op in [
         "health",
         "gpu_info",
-        "list_profiles",
         "list_monitors",
         "list_windows",
         "list_application_audio",
