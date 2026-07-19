@@ -94,7 +94,9 @@ fn main() -> anyhow::Result<()> {
         for p in &frame.planes {
             unsafe { libc::close(p.fd) };
         }
-        enc.send_hw(hw_frame, sent as i64)?;
+        // SAFETY: frisch von `upload_swframe` bzw. dem Capture-Pfad geliefert,
+        // noch nicht freigegeben, Format passt zum gebundenen Frames-Kontext.
+        unsafe { enc.send_hw(hw_frame, sent as i64)? };
         unsafe { av_frame_free(&mut hw_frame) };
         sent += 1;
         if sent % 60 == 0 {
