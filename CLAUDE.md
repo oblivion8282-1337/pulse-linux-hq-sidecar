@@ -19,13 +19,13 @@ stdio JSON-RPC über newline-delimited JSON, **byte-identisch** zu
 Pulse-Repo für die Spec.
 - Request: `{"op":"...","id":<num>?,"params"}` · Response: `{"id","ok","fields"}` (flach!)
   · Event: `{"ev":"..."}` (kein id/ok).
-- Ops: `health, gpu_info, list_profiles, list_monitors, list_windows,
+- Ops: `health, gpu_info, list_monitors, list_windows,
   list_application_audio, build_argv, start, stop, state`.
 - States: `idle|starting|live|error|stopped`. Events: `state, fps, log, error, stopped`.
 - Token in URLs (pass=/token=) wird in `argv`/Logs **redacted** (`***`).
 
 Verbatim-portierte Dateien (nicht ohne Not anfassen): `proto.rs, dispatch.rs, events.rs,
-main.rs, profiles.rs, encode/mux_writer.rs, ops/{list_profiles,stop,state}.rs`.
+main.rs, profiles.rs, encode/mux_writer.rs, ops/{stop,state}.rs`.
 
 ## Architektur-Entscheidungen (Nutzer-Vorgaben — einhalten)
 - **System-FFmpeg** via pkg-config (Arch n8.1.2, `--enable-gnutls --enable-libdrm

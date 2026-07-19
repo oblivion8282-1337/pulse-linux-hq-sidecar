@@ -19,16 +19,12 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
 
 use crate::capture::audio::AudioSelection;
-use crate::profiles::profile_by_name;
+use crate::profiles::{BASELINE, profile_label};
 use crate::stream_controller::{ResolutionRequest, StartParams, StreamController};
 
 pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
-    let profile_name = params
-        .get("profile")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("profile (Name) ist Pflicht"))?;
-    let profile = profile_by_name(profile_name)
-        .ok_or_else(|| anyhow!("Unknown stream profile: {profile_name}"))?;
+    let profile_name = profile_label(&params);
+    let profile = &BASELINE;
 
     let channel = params
         .get("channel")
@@ -51,10 +47,10 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
     // Codec-Wahl mit zwei Sicherheitsnetzen, Reihenfolge fest:
     // 1. Kann die HW den gewünschten Codec nicht encodieren, auf H.264 zurück-
     //    fallen statt den Encoder-open crashen zu lassen. Die UI bietet AV1 auf
-    //    solcher HW zwar gar nicht erst an (list_profiles filtert über dieselbe
-    //    Probe), aber ein veralteter Client / Direktaufruf käme sonst zum harten
-    //    Fehler. Geht auch H.264 nicht, bleibt der Wunsch stehen → echter,
-    //    ehrlicher Encoder-Fehler.
+    //    solcher HW zwar gar nicht erst an (der `health`-Report filtert über
+    //    dieselbe Probe), aber ein veralteter Client / Direktaufruf käme sonst
+    //    zum harten Fehler. Geht auch H.264 nicht, bleibt der Wunsch stehen →
+    //    echter, ehrlicher Encoder-Fehler.
     // 2. WHIP-Ziel (App-gehostete Instanz): der ffmpeg-8.1-WHIP-Muxer kann kein
     //    AV1 → auf H.264 ausweichen statt beim write_header hart zu scheitern.
     let mut codec = if crate::caps::supports_codec(&requested_codec) {
@@ -127,7 +123,7 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
 
     let argv = build_redacted_argv(
         &push_url,
-        profile.name,
+        profile_name,
         &codec,
         fps,
         bitrate_kbps,

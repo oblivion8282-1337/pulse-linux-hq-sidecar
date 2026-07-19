@@ -16,8 +16,8 @@ gleiches stdio-JSON-RPC-Protokoll wie `gsr-sidecar/control.py`.
   Portal-Verhandlung via `ashpd`).
 
 ## Stand
-- ✅ Protokoll-Skelett (wire-identisch zu `control.py`): health/gpu_info/list_profiles/
-  state/stop/build_argv/start.
+- ✅ Protokoll-Skelett (wire-identisch zu `control.py`): health/gpu_info/state/stop/
+  build_argv/start.
 - ✅ TLS-De-Risk: `tls_backend=gnutls`, RTMPS-Connect mit `tls_verify=0` gegen self-signed
   MediaMTX-Cert funktioniert (`examples/tls_probe.rs`).
 - ✅ DRM-Vendor-Erkennung (sysfs: nvidia/amd/intel + `/dev/dri/renderDXXX`).
