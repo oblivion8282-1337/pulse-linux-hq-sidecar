@@ -455,28 +455,44 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     //    detect() bevorzugt blind die dGPU; auf Multi-GPU (dGPU + iGPU) kann der
     //    Compositor den Monitor aber auf der anderen Karte halten, und ein
     //    LINEAR-Modifier (0x0) verrät den Besitzer NICHT. Also: den ersten Frame
-    //    der Reihe nach auf jeder Kandidaten-GPU importieren — wer ihn nehmen
+    //    der Reihe nach auf jedem Kandidaten importieren — wer ihn nehmen
     //    kann, besitzt ihn (Cross-GPU-Import scheitert sonst mit
-    //    glEGLImageTargetTexture2DOES 0x0502 bzw. VAAPI-hwmap). Reihenfolge:
-    //    Modifier-Hinweis (falls getilt), detect-Default, übrige Karten. Ein
-    //    explizites PULSE_HQ_VENDOR erlaubt keine Ausweichkarte.
-    let candidates: Vec<Vendor> = if std::env::var_os("PULSE_HQ_VENDOR").is_some() {
-        vec![orig_vendor]
-    } else {
-        // Reihenfolge: Modifier-Hinweis (falls getilt), detect-Default, übrige
-        // Karten — dedupliziert unter Beibehaltung der ersten Position.
-        let mut c = Vec::new();
-        for v in drm::vendor_from_modifier(first.modifier)
-            .into_iter()
-            .chain(std::iter::once(orig_vendor))
-            .chain(drm::present_vendors())
-        {
-            if !c.contains(&v) {
-                c.push(v);
-            }
-        }
-        c
-    };
+    //    glEGLImageTargetTexture2DOES 0x0502 bzw. VAAPI-hwmap).
+    //
+    //    Kandidaten sind einzelne KARTEN (Render-Nodes), nicht Hersteller: zwei
+    //    Karten desselben Herstellers (Ryzen-iGPU + AMD-dGPU) wären auf Vendor-
+    //    Ebene ununterscheidbar — nur die zufällig erste würde je probiert.
+    //    Hersteller-Reihenfolge: Modifier-Hinweis (falls getilt), detect-
+    //    Default, Rest; innerhalb eines Herstellers sysfs-Reihenfolge.
+    //    Overrides: PULSE_HQ_RENDER_NODE erzwingt genau EINE Karte (Notbremse
+    //    für Support-Fälle), PULSE_HQ_VENDOR alle Karten SEINES Herstellers —
+    //    beide erlauben keine Ausweichkarte anderer Hersteller.
+    let candidates: Vec<(Vendor, String)> =
+        if let Some(node) = std::env::var_os("PULSE_HQ_RENDER_NODE") {
+            let node = node.to_string_lossy().into_owned();
+            let vendor = drm::vendor_of_node(&node).ok_or_else(|| {
+                anyhow!("PULSE_HQ_RENDER_NODE={node}: keine bekannte DRM-Render-Node")
+            })?;
+            vec![(vendor, node)]
+        } else {
+            let vendor_order: Vec<Vendor> = if std::env::var_os("PULSE_HQ_VENDOR").is_some() {
+                vec![orig_vendor]
+            } else {
+                // Dedupliziert unter Beibehaltung der ersten Position.
+                let mut c = Vec::new();
+                for v in drm::vendor_from_modifier(first.modifier)
+                    .into_iter()
+                    .chain(std::iter::once(orig_vendor))
+                    .chain(drm::present_vendors())
+                {
+                    if !c.contains(&v) {
+                        c.push(v);
+                    }
+                }
+                c
+            };
+            candidate_nodes(&vendor_order, &drm::render_nodes())
+        };
 
     let build_importer = |cand: Vendor, node: &str| -> Result<FrameImporter> {
         match cand {
@@ -508,22 +524,30 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         }
     };
 
-    let mut chosen: Option<(Vendor, FrameImporter, *mut ffmpeg::ffi::AVFrame)> = None;
+    let mut chosen: Option<(Vendor, String, FrameImporter, *mut ffmpeg::ffi::AVFrame)> = None;
     let mut last_err: Option<anyhow::Error> = None;
-    for cand in candidates {
-        let node = drm::render_node_for(cand).unwrap_or_default();
+    for (cand, node) in candidates {
         match build_importer(cand, &node).and_then(|mut imp| {
             let frame = imp.import(&first)?;
             Ok((imp, frame))
         }) {
             Ok((imp, frame)) => {
-                chosen = Some((cand, imp, frame));
+                chosen = Some((cand, node, imp, frame));
                 break;
             }
             Err(e) => {
+                // Auch als Event: WELCHE Karte abgelehnt hat, ist im Support-
+                // Fall die halbe Diagnose (falsche Karte vs. Puffer-Format).
+                emit(Event::Log {
+                    line: format!(
+                        "[stream] Import auf {} ({}) fehlgeschlagen: {e:#}",
+                        display_node(&node),
+                        cand.slug()
+                    ),
+                });
                 tracing::warn!(
-                    target: "stream", vendor = cand.slug(),
-                    "GPU-Import fehlgeschlagen, nächste Karte: {e:#}"
+                    target: "stream", vendor = cand.slug(), node = %node,
+                    "GPU-Import fehlgeschlagen, nächster Kandidat: {e:#}"
                 );
                 last_err = Some(e);
             }
@@ -532,7 +556,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     // close_planes auch im Fehlerfall — sonst leaken die DMABUF-fds des ersten
     // Frames und halten GPU-Puffer fest (schlimm genau dann, wenn die GPU eh
     // schon in Speichernot ist und der User mehrfach neu startet).
-    let Some((vendor, mut importer, mut last_hw)) = chosen else {
+    let Some((vendor, node, mut importer, mut last_hw)) = chosen else {
         close_planes(&first);
         return Err(
             last_err.unwrap_or_else(|| anyhow!("kein GPU-Importer für den aufgenommenen Buffer"))
@@ -541,8 +565,9 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     close_planes(&first);
     emit(Event::Log {
         line: format!(
-            "[stream] Encode-Pfad: {}",
-            if matches!(vendor, Vendor::Nvidia) { "NVENC" } else { "VAAPI" }
+            "[stream] Encode-Pfad: {} auf {}",
+            if matches!(vendor, Vendor::Nvidia) { "NVENC" } else { "VAAPI" },
+            display_node(&node)
         ),
     });
     if vendor != orig_vendor {
@@ -699,6 +724,74 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     }
     let finish_result = enc.finish();
     run_result.and(finish_result)
+}
+
+/// Import-Kandidaten in Hersteller-Reihenfolge zu konkreten Render-Nodes
+/// auflösen. AMD/Intel: JEDE Karte des Herstellers einzeln (VAAPI bindet an
+/// den Node-Pfad). NVIDIA: ein Versuch genügt — der NVENC-Importer läuft über
+/// CUDA und ignoriert den Node-Pfad (leerer Pfad, falls nvidia-drm keine
+/// Render-Node zeigt).
+fn candidate_nodes(vendor_order: &[Vendor], nodes: &[(Vendor, String)]) -> Vec<(Vendor, String)> {
+    let mut out = Vec::new();
+    for &v in vendor_order {
+        let mut of_vendor = nodes.iter().filter(|(nv, _)| *nv == v).cloned();
+        match v {
+            Vendor::Nvidia => out.push(of_vendor.next().unwrap_or((v, String::new()))),
+            Vendor::Amd | Vendor::Intel => out.extend(of_vendor),
+        }
+    }
+    out
+}
+
+/// Node-Pfad fürs Log; der NVENC-Pfad hat keinen (CUDA wählt die Karte selbst).
+fn display_node(node: &str) -> &str {
+    if node.is_empty() { "CUDA-Default" } else { node }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+
+    #[test]
+    fn same_vendor_cards_are_separate_candidates() {
+        // Der Support-Fall: Ryzen-iGPU + RX-6000-dGPU = zwei AMD-Nodes. Beide
+        // müssen probiert werden, egal welche zuerst enumeriert wurde.
+        let nodes = vec![
+            (Vendor::Amd, "/dev/dri/renderD128".to_string()),
+            (Vendor::Amd, "/dev/dri/renderD129".to_string()),
+        ];
+        let c = candidate_nodes(&[Vendor::Amd], &nodes);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].1, "/dev/dri/renderD128");
+        assert_eq!(c[1].1, "/dev/dri/renderD129");
+    }
+
+    #[test]
+    fn vendor_order_wins_over_node_order() {
+        let nodes = vec![
+            (Vendor::Nvidia, "/dev/dri/renderD128".to_string()),
+            (Vendor::Amd, "/dev/dri/renderD129".to_string()),
+        ];
+        // Modifier-Hinweis sagt AMD → AMD-Node vor der NVIDIA-Karte.
+        let c = candidate_nodes(&[Vendor::Amd, Vendor::Nvidia], &nodes);
+        assert_eq!(c[0], (Vendor::Amd, "/dev/dri/renderD129".to_string()));
+        assert_eq!(c[1], (Vendor::Nvidia, "/dev/dri/renderD128".to_string()));
+    }
+
+    #[test]
+    fn nvidia_once_and_without_node_if_absent() {
+        // Zwei NVIDIA-Nodes → ein Kandidat (CUDA wählt selbst); ganz ohne
+        // NVIDIA-Node bleibt NVENC mit leerem Pfad probierbar.
+        let nodes = vec![
+            (Vendor::Nvidia, "/dev/dri/renderD128".to_string()),
+            (Vendor::Nvidia, "/dev/dri/renderD129".to_string()),
+        ];
+        assert_eq!(candidate_nodes(&[Vendor::Nvidia], &nodes).len(), 1);
+        assert_eq!(
+            candidate_nodes(&[Vendor::Nvidia], &[]),
+            vec![(Vendor::Nvidia, String::new())]
+        );
+    }
 }
 
 /// DMABUF-fds eines Frames schließen (wir besitzen die dup'ten fds).

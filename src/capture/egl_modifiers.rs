@@ -9,8 +9,15 @@
 //! libEGL wird per dlopen geladen (kein Link-Time-Dep); Display über
 //! `EGL_EXT_platform_device` (headless, kein Wayland-Connect nötig — NVIDIA
 //! und Mesa unterstützen beide die Device-Plattform). Wir vereinigen die
-//! Modifier ALLER Devices: zu viel anzubieten ist harmlos (der Compositor
+//! Modifier ALLER Devices: zu viel anzubieten ist meist harmlos (der Compositor
 //! schneidet auf seine Menge), zu wenig lässt die Verhandlung scheitern.
+//!
+//! EINE Ausnahme vom "zu viel ist harmlos": Die EGL-Liste stammt von der
+//! 3D-Einheit — sie enthält auf AMD auch DCC-komprimierte Varianten, die die
+//! Video-Einheit (VCN, unser VAAPI-Import) vor GFX12/RDNA4 NICHT lesen kann.
+//! Wählt der Compositor so eine (KDE auf RDNA2 tut das), scheitert später
+//! `hwmap` beim ersten Frame mit EINVAL (-22). Deshalb filtert
+//! `query_dmabuf_modifiers` diese Varianten raus, s. `vcn_incompatible_dcc`.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
@@ -48,6 +55,22 @@ pub fn query_dmabuf_modifiers(fourccs: &[u32]) -> HashMap<u32, Vec<u64>> {
         tracing::warn!(target: "egl", "EGL-Modifier-Abfrage fehlgeschlagen ({e}) — Fallback LINEAR/INVALID");
     }
 
+    // DCC-Varianten aussortieren, die die Video-Einheit nicht importieren kann
+    // (Support-Fall 2026-07-20: RX 6000/RDNA2 + KDE → rc=-22 beim ersten
+    // Frame). Der Compositor weicht auf eine der verbleibenden unkomprimierten/
+    // getilten Varianten aus; RDNA4-Modifier (transparentes DCC) bleiben drin.
+    for mods in out.values_mut() {
+        let before = mods.len();
+        mods.retain(|&m| !vcn_incompatible_dcc(m));
+        if before > mods.len() {
+            tracing::info!(
+                target: "egl",
+                "{} AMD-DCC-Modifier gefiltert (VCN vor GFX12 kann DCC nicht lesen)",
+                before - mods.len()
+            );
+        }
+    }
+
     for &fourcc in fourccs {
         let mods = out.entry(fourcc).or_default();
         if mods.is_empty() {
@@ -60,6 +83,21 @@ pub fn query_dmabuf_modifiers(fourccs: &[u32]) -> HashMap<u32, Vec<u64>> {
         }
     }
     out
+}
+
+/// AMD-Modifier mit DCC-Kompression, die die Video-Einheit (VCN) nicht lesen
+/// kann. Bit-Layout aus `drm_fourcc.h`: Top-Byte = Vendor (AMD=0x02),
+/// Bits 0..8 = `AMD_FMT_MOD_TILE_VERSION` (GFX12/RDNA4 = 5), Bit 13 = DCC.
+/// Vor GFX12 kann NUR die 3D-Einheit DCC dekomprimieren; ab GFX12 ist die
+/// Kompression "transparent" (alle Blöcke inkl. VCN lesen sie) — deshalb die
+/// Generations-Grenze statt Pauschal-Filter.
+fn vcn_incompatible_dcc(modifier: u64) -> bool {
+    const DRM_FORMAT_MOD_VENDOR_AMD: u64 = 0x02;
+    const AMD_FMT_MOD_DCC: u64 = 1 << 13;
+    const AMD_FMT_MOD_TILE_VER_GFX12: u64 = 5;
+    modifier >> 56 == DRM_FORMAT_MOD_VENDOR_AMD
+        && modifier & AMD_FMT_MOD_DCC != 0
+        && modifier & 0xFF < AMD_FMT_MOD_TILE_VER_GFX12
 }
 
 fn query_into(fourccs: &[u32], out: &mut HashMap<u32, Vec<u64>>) -> Result<(), String> {
@@ -145,5 +183,38 @@ fn query_into(fourccs: &[u32], out: &mut HashMap<u32, Vec<u64>>) -> Result<(), S
             return Err("kein EGL-Display mit dmabuf-modifier-Support gefunden".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dcc_filter_tests {
+    use super::*;
+
+    /// AMD-Modifier aus Tile-Version + DCC-Bit zusammensetzen (Layout wie in
+    /// `vcn_incompatible_dcc` dokumentiert).
+    fn amd_mod(tile_version: u64, dcc: bool) -> u64 {
+        (0x02 << 56) | tile_version | if dcc { 1 << 13 } else { 0 }
+    }
+
+    #[test]
+    fn filters_pre_gfx12_dcc_only() {
+        // RDNA2 (GFX10_RBPLUS=3) + DCC → die Kombination aus dem Support-Fall.
+        assert!(vcn_incompatible_dcc(amd_mod(3, true)));
+        // RDNA3 (GFX11=4) + DCC → gleiche VCN-Grenze.
+        assert!(vcn_incompatible_dcc(amd_mod(4, true)));
+        // RDNA2 OHNE DCC (normal getilt) → bleibt.
+        assert!(!vcn_incompatible_dcc(amd_mod(3, false)));
+        // RDNA4 (GFX12=5) + DCC → transparent, bleibt.
+        assert!(!vcn_incompatible_dcc(amd_mod(5, true)));
+    }
+
+    #[test]
+    fn leaves_foreign_and_special_modifiers_alone() {
+        assert!(!vcn_incompatible_dcc(DRM_FORMAT_MOD_LINEAR));
+        assert!(!vcn_incompatible_dcc(DRM_FORMAT_MOD_INVALID));
+        // NVIDIA-Modifier (Vendor 0x03, live auf der Dev-Maschine gesehen).
+        assert!(!vcn_incompatible_dcc(0x0300000000606010));
+        // Intel-CCS (Vendor 0x01) — anderes Kompressionsschema, nicht unser Filter.
+        assert!(!vcn_incompatible_dcc((0x01 << 56) | (1 << 13) | 4));
     }
 }

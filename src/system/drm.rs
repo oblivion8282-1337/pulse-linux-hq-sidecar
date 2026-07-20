@@ -136,13 +136,23 @@ pub fn detect() -> Option<(Vendor, String)> {
     Some((pick.vendor, path))
 }
 
-/// Render-Node-Pfad für einen bestimmten Vendor (für den VAAPI-hwdevice), falls
-/// auf dieser Maschine vorhanden. NVENC/CUDA braucht keinen Render-Node.
-pub fn render_node_for(vendor: Vendor) -> Option<String> {
+/// Alle Render-Nodes (Vendor + Pfad) in sysfs-Reihenfolge — für den
+/// pro-Karte-Import-Fallback. Zwei Karten desselben Herstellers (Ryzen-iGPU +
+/// AMD-dGPU) sind auf Vendor-Ebene ununterscheidbar; wer den aufgenommenen
+/// Buffer besitzt, entscheidet sich erst beim Import-Versuch pro Node.
+pub fn render_nodes() -> Vec<(Vendor, String)> {
     enumerate_render_nodes()
         .into_iter()
-        .find(|n| n.vendor == vendor)
-        .map(|n| n.path.to_string_lossy().to_string())
+        .map(|n| (n.vendor, n.path.to_string_lossy().to_string()))
+        .collect()
+}
+
+/// Vendor einer konkreten Render-Node (für den `PULSE_HQ_RENDER_NODE`-Override).
+pub fn vendor_of_node(path: &str) -> Option<Vendor> {
+    enumerate_render_nodes()
+        .into_iter()
+        .find(|n| n.path.to_string_lossy() == path)
+        .map(|n| n.vendor)
 }
 
 /// Alle auf dieser Maschine anwesenden GPU-Vendors (distinct), dGPU vor iGPU.
