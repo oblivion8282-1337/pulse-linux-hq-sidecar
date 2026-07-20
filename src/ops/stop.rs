@@ -20,7 +20,9 @@ pub fn handle(_params: Map<String, Value>) -> Result<Map<String, Value>> {
         })));
     }
     ctrl.stop()?;
-    Ok(Map::new())
+    // Gleiche Shape wie der Idempotenz-Zweig — der Parent muss `running` nicht
+    // je nach Pfad mal lesen können und mal nicht.
+    Ok(json_to_map(json!({ "running": false })))
 }
 
 fn json_to_map(v: Value) -> Map<String, Value> {

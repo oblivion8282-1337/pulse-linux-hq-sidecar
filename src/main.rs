@@ -57,23 +57,26 @@ fn main() -> anyhow::Result<()> {
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    let mut line = String::new();
+    // Bytes statt `read_line`: ein einziges Nicht-UTF-8-Byte würde dort als
+    // `InvalidData`-Error den ganzen Prozess (und einen laufenden Stream) hart
+    // beenden — stattdessen antwortet `handle_request_bytes` deterministisch
+    // mit `{"id":null,"ok":false}`.
+    let mut line: Vec<u8> = Vec::new();
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line)?;
+        let n = reader.read_until(b'\n', &mut line)?;
         if n == 0 {
             break; // EOF on stdin (Electron closed our stdin) → shut down.
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
 
         // Wie mac-hq-sidecar: kein self-exit nach `stop` — der Sidecar bleibt
         // über Streams hinweg warm und `sidecar.ts` hält den Child am Leben
         // (Windows-only respawn). Der Loop läuft bis stdin-EOF.
-        let response = dispatch::handle_request_line(trimmed);
+        let response = dispatch::handle_request_bytes(&line);
         match serde_json::to_value(&response) {
             Ok(v) => {
                 if out_tx.send(v).is_err() {

@@ -115,7 +115,6 @@ type FnGetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type FnEglQueryDevices = unsafe extern "C" fn(i32, *mut *mut c_void, *mut i32) -> u32;
 type FnEglGetPlatformDisplay = unsafe extern "C" fn(u32, *mut c_void, *const i32) -> EglDisplay;
 type FnEglInitialize = unsafe extern "C" fn(EglDisplay, *mut i32, *mut i32) -> u32;
-type FnEglTerminate = unsafe extern "C" fn(EglDisplay) -> u32;
 type FnEglBindApi = unsafe extern "C" fn(u32) -> u32;
 type FnEglCreateContext =
     unsafe extern "C" fn(EglDisplay, *mut c_void, EglContext, *const i32) -> EglContext;
@@ -191,7 +190,6 @@ pub struct NvDmabufImporter {
     dpy: EglDisplay,
     ctx: EglContext,
 
-    egl_terminate: FnEglTerminate,
     egl_destroy_context: FnEglDestroyContext,
     egl_make_current: FnEglMakeCurrent,
     egl_create_image: FnEglCreateImage,
@@ -279,7 +277,6 @@ impl NvDmabufImporter {
             let get_proc = *get_proc;
 
             let egl_initialize = egl_proc!(get_proc, "eglInitialize", FnEglInitialize);
-            let egl_terminate = egl_proc!(get_proc, "eglTerminate", FnEglTerminate);
             let egl_bind_api = egl_proc!(get_proc, "eglBindAPI", FnEglBindApi);
             let egl_create_context = egl_proc!(get_proc, "eglCreateContext", FnEglCreateContext);
             let egl_destroy_context =
@@ -335,8 +332,12 @@ impl NvDmabufImporter {
                 if egl_initialize(dpy, &mut major, &mut minor) != EGL_TRUE {
                     continue;
                 }
+                // KEIN eglTerminate auf verworfenen Kandidaten: Device-Displays
+                // sind prozessweit geteilt (gleiches Handle für alle Nutzer) und
+                // nicht refcounted — Terminate würde z. B. `egl_modifiers` auf
+                // demselben Device die Füße wegziehen. Initialisierte Displays
+                // bleiben stehen (bounded: eins pro GPU).
                 if egl_bind_api(EGL_OPENGL_API) != EGL_TRUE {
-                    egl_terminate(dpy);
                     continue;
                 }
                 // configless (EGL_KHR_no_config_context) + surfaceless.
@@ -344,12 +345,10 @@ impl NvDmabufImporter {
                 let ctx =
                     egl_create_context(dpy, ptr::null_mut(), ptr::null_mut(), attribs.as_ptr());
                 if ctx.is_null() {
-                    egl_terminate(dpy);
                     continue;
                 }
                 if egl_make_current(dpy, ptr::null_mut(), ptr::null_mut(), ctx) != EGL_TRUE {
                     egl_destroy_context(dpy, ctx);
-                    egl_terminate(dpy);
                     continue;
                 }
                 let version_ptr = gl_get_string(GL_VERSION);
@@ -365,10 +364,44 @@ impl NvDmabufImporter {
                 }
                 egl_make_current(dpy, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
                 egl_destroy_context(dpy, ctx);
-                egl_terminate(dpy);
             }
             let (dpy, ctx) = found
                 .ok_or_else(|| anyhow!("kein EGL-Device mit NVIDIA-GL-Context gefunden"))?;
+
+            // Ab hier ist der Context CURRENT auf diesem Thread — jeder
+            // Fehlerpfad bis zur fertigen `Self` muss ihn un-current machen und
+            // zerstören, sonst leakt er UND stört als stale-current-Context
+            // spätere EGL-Nutzung des Threads (CUDA kaputt/fehlend ist der
+            // Alltagsfall: nvidia-Modul nicht geladen, Treiber-Reste).
+            struct EglCleanup {
+                dpy: EglDisplay,
+                ctx: EglContext,
+                make_current: FnEglMakeCurrent,
+                destroy: FnEglDestroyContext,
+                armed: bool,
+            }
+            impl Drop for EglCleanup {
+                fn drop(&mut self) {
+                    if self.armed {
+                        unsafe {
+                            (self.make_current)(
+                                self.dpy,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                            );
+                            (self.destroy)(self.dpy, self.ctx);
+                        }
+                    }
+                }
+            }
+            let mut egl_cleanup = EglCleanup {
+                dpy,
+                ctx,
+                make_current: egl_make_current,
+                destroy: egl_destroy_context,
+                armed: true,
+            };
 
             // CUDA: Primary-Context retainen (denselben nutzt FFmpeg via
             // AV_CUDA_USE_PRIMARY_CONTEXT).
@@ -414,12 +447,13 @@ impl NvDmabufImporter {
                 return Err(anyhow!("cuDevicePrimaryCtxRetain failed (rc={r})"));
             }
 
+            // Ab hier übernimmt `Self::drop` das EGL-Teardown.
+            egl_cleanup.armed = false;
             let mut me = Self {
                 _egl_lib: egl_lib,
                 _cuda_lib: cuda_lib,
                 dpy,
                 ctx,
-                egl_terminate,
                 egl_destroy_context,
                 egl_make_current,
                 egl_create_image,
@@ -535,8 +569,17 @@ impl NvDmabufImporter {
                     (self.cu_unregister_resource)(s.cu_res);
                     let mut old: CuContext = ptr::null_mut();
                     (self.cu_ctx_pop)(&mut old);
+                    (self.gl_delete_textures)(1, &s.tex);
+                } else {
+                    // Context tot (Device-Loss): die CUDA-Resource referenziert
+                    // die Textur weiter — sie TROTZDEM zu löschen hieße, der
+                    // registrierten Resource die Textur unterm Hintern
+                    // wegzuziehen (UB bei Treiber-Recovery). Bewusst leaken.
+                    tracing::warn!(
+                        target: "nvenc",
+                        "cuCtxPushCurrent fehlgeschlagen — Staging-Textur bleibt registriert (Device-Loss?)"
+                    );
                 }
-                (self.gl_delete_textures)(1, &s.tex);
             }
         }
     }
@@ -781,7 +824,9 @@ impl Drop for NvDmabufImporter {
             }
             (self.egl_make_current)(self.dpy, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
             (self.egl_destroy_context)(self.dpy, self.ctx);
-            (self.egl_terminate)(self.dpy);
+            // KEIN eglTerminate: das Device-Display ist prozessweit geteilt
+            // (egl_modifiers fragt es bei jedem Capture-Start ab) und nicht
+            // refcounted — Terminate würde fremde Contexts/Images zerstören.
             (self.cu_primary_ctx_release)(self.cu_device);
         }
     }

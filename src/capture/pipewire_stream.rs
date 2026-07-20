@@ -22,7 +22,7 @@
 
 use std::io::Cursor;
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use drm_fourcc::DrmFourcc;
@@ -48,8 +48,18 @@ pub struct DmabufPlane {
     pub stride: i32,
 }
 
+/// Die Plane BESITZT ihren dup'ten fd — Drop schließt ihn. Damit leaken auch
+/// Frames nicht, die nie einen Consumer erreichen (Kanal voll, Receiver weg,
+/// beim Stop noch gequeue'd) — vorher Aufgabe des Callers (`close_planes`),
+/// was genau diese Pfade übersah.
+impl Drop for DmabufPlane {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 /// Ein capturter Frame: DMABUF-Planes + Maße + negotiiertes DRM-Format.
-/// Caller muss die fds schließen.
+/// Die fds gehören den Planes und schließen sich beim Drop.
 #[derive(Debug)]
 pub struct DmabufFrame {
     pub planes: Vec<DmabufPlane>,
@@ -74,7 +84,7 @@ pub struct DmabufFrame {
 
 /// User-Daten für die Stream-Listener (auf dem Worker-Thread).
 struct StreamData {
-    frame_tx: Sender<DmabufFrame>,
+    frame_tx: SyncSender<DmabufFrame>,
     width: u32,
     height: u32,
     drm_fourcc: u32,
@@ -119,7 +129,12 @@ impl PipewireCapture {
     /// Starte den Capture-Worker. `pw_fd` vom Portal (`open_pipewire_remote`),
     /// `node_id` vom Portal-`Start`.
     pub fn start(pw_fd: OwnedFd, node_id: u32, width: u32, height: u32) -> anyhow::Result<(Receiver<DmabufFrame>, Self)> {
-        let (frame_tx, frame_rx) = channel::<DmabufFrame>();
+        // Bounded: stallt der Consumer (RTMPS-Backpressure, Encoder hängt),
+        // dürfen sich nicht unbegrenzt Frames mit je 1–4 dup'ten DMABUF-fds
+        // stapeln (EMFILE). `try_send` im process-Callback verwirft dann den
+        // ältesten Zustand nicht — der neue Frame droppt (fds schließen sich)
+        // und der Consumer holt beim nächsten Drain den letzten gequeue'ten.
+        let (frame_tx, frame_rx) = sync_channel::<DmabufFrame>(8);
         let (stop_tx, stop_rx) = pw::channel::channel::<()>();
 
         let worker = thread::Builder::new()
@@ -133,12 +148,23 @@ impl PipewireCapture {
     }
 
     /// Stoppe den Worker (Mainloop-quit + join). Schließt die
-    /// PipeWire-Verbindung.
+    /// PipeWire-Verbindung. Idempotent.
     pub fn stop(&mut self) {
         let _ = self.stop_tx.send(());
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+    }
+}
+
+/// Ohne Drop liefe der Capture-Thread nach jedem Fehl-Start (kein Frame in
+/// 10s, kein GPU-Importer, Encoder-open scheitert) für immer weiter — mit
+/// offener Portal-Session (Screenshare-Indikator an) und fd-dup pro Frame.
+/// Die frühen `return Err`-Pfade in `run_stream` erreichen `cap.stop()` nie;
+/// Drop macht das Teardown Pfad-unabhängig.
+impl Drop for PipewireCapture {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -269,7 +295,7 @@ fn run_pipewire(
     node_id: u32,
     width: u32,
     height: u32,
-    frame_tx: Sender<DmabufFrame>,
+    frame_tx: SyncSender<DmabufFrame>,
     stop_rx: pw::channel::Receiver<()>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -397,7 +423,11 @@ fn run_pipewire(
                         pods.extend(
                             ud.enum_format_bytes.iter().filter_map(|b| Pod::from_bytes(b)),
                         );
-                        let _ = s.update_params(&mut pods);
+                        if let Err(e) = s.update_params(&mut pods) {
+                            // Verhandlung bliebe sonst still stehen (kein Frame,
+                            // kein Fehler) — mindestens die Diagnose loggen.
+                            tracing::warn!(target: "pipewire", "update_params (Fixierung) fehlgeschlagen: {e}");
+                        }
                         return;
                     }
                     tracing::debug!(
@@ -442,7 +472,9 @@ fn run_pipewire(
             let Some(buffers) = build_buffers_pod(data_type_mask) else { return };
             if let Some(pod) = Pod::from_bytes(&buffers) {
                 let mut params = [pod];
-                let _ = s.update_params(&mut params);
+                if let Err(e) = s.update_params(&mut params) {
+                    tracing::warn!(target: "pipewire", "update_params (ParamBuffers) fehlgeschlagen: {e}");
+                }
             }
         })
         .remove_buffer(|_s, ud, _buf| {
@@ -481,11 +513,17 @@ fn run_pipewire(
                     continue;
                 }
                 let chunk = d.chunk();
-                // dup: PipeWire besitzt den Original-fd; der Encoder braucht einen
-                // eigenen (wird nach Encode geschlossen).
-                let dup = unsafe { libc::dup(fd) };
+                // dup (CLOEXEC — Kinder sollen keine in-flight DMABUF-fds
+                // erben): PipeWire besitzt den Original-fd; der Encoder braucht
+                // einen eigenen (Plane-Drop schließt ihn nach dem Encode).
+                let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
                 if dup < 0 {
-                    continue;
+                    // Teil-dup'te Frames NICHT senden: fehlt eine Plane,
+                    // verrutschen die Indizes und der Importer cachet unter
+                    // `buffer_key` dauerhaft ein falsch gebautes EGLImage.
+                    // Bereits dup'te fds schließt der Plane-Drop.
+                    tracing::warn!(target: "pipewire", "F_DUPFD_CLOEXEC fehlgeschlagen — Frame verworfen");
+                    return;
                 }
                 planes.push(DmabufPlane {
                     fd: dup,
@@ -494,7 +532,8 @@ fn run_pipewire(
                 });
             }
             if !planes.is_empty() {
-                let _ = ud.frame_tx.send(DmabufFrame {
+                // Voll oder Receiver weg → Frame droppt, Plane-fds schließen sich.
+                let _ = ud.frame_tx.try_send(DmabufFrame {
                     planes,
                     width: ud.width,
                     height: ud.height,
@@ -526,4 +565,37 @@ fn run_pipewire(
     mainloop.run();
     tracing::debug!(target: "pipewire", "Mainloop beendet (stop)");
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_drop_tests {
+    use super::*;
+
+    fn fd_is_open(fd: RawFd) -> bool {
+        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) != -1
+    }
+
+    /// Ein gedroppter Frame muss seine (dup'ten) fds schließen — Frames, die im
+    /// Kanal verworfen werden (Stop, toter Receiver, voller Kanal), leaken sonst.
+    #[test]
+    fn dropping_a_frame_closes_its_plane_fds() {
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let frame = DmabufFrame {
+            planes: vec![
+                DmabufPlane { fd: fds[0], offset: 0, stride: 0 },
+                DmabufPlane { fd: fds[1], offset: 0, stride: 0 },
+            ],
+            width: 1,
+            height: 1,
+            drm_fourcc: 0,
+            modifier: 0,
+            pts: 0,
+            buffer_key: 1,
+            epoch: 0,
+        };
+        drop(frame);
+        assert!(!fd_is_open(fds[0]), "Plane-fd 0 muss nach Drop geschlossen sein");
+        assert!(!fd_is_open(fds[1]), "Plane-fd 1 muss nach Drop geschlossen sein");
+    }
 }

@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Portal → PipeWire-DMABUF-Frames.
-    let session = match portal::open(true) {
+    let session = match portal::open(true, &std::sync::atomic::AtomicBool::new(false)) {
         Ok(s) => s,
         Err(e) if portal::is_portal_canceled(&e) => {
             eprintln!("[capture_encode] Portal abgebrochen → Exit 60");

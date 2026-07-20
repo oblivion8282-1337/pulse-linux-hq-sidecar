@@ -17,7 +17,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
 
-    let session = match portal::open(true) {
+    let session = match portal::open(true, &std::sync::atomic::AtomicBool::new(false)) {
         Ok(s) => s,
         Err(e) if portal::is_portal_canceled(&e) => {
             eprintln!("[capture_smoke] Portal abgebrochen → Exit 60");

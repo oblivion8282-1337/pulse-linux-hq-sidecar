@@ -80,10 +80,12 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         .and_then(Value::as_u64)
         .unwrap_or(profile.fps as u64)
         .clamp(1, 1000) as u32;
-    let bitrate_kbps = overrides
-        .and_then(|o| o.get("bitrate_kbps"))
-        .and_then(Value::as_u64)
-        .unwrap_or(profile.bitrate_kbps as u64) as u32;
+    let bitrate_kbps = clamp_bitrate(
+        overrides
+            .and_then(|o| o.get("bitrate_kbps"))
+            .and_then(Value::as_u64)
+            .unwrap_or(profile.bitrate_kbps as u64),
+    );
     let av_offset_ms = params
         .get("av_offset_ms")
         .and_then(Value::as_i64)
@@ -154,6 +156,31 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         Value::Array(argv.into_iter().map(Value::String).collect()),
     );
     Ok(out)
+}
+
+/// `overrides.bitrate_kbps` in einen sinnvollen Bereich zwingen. Ohne Clamp
+/// verstümmelt der `as u32`-Cast Werte > u32::MAX modulo (2^32+500 → 500,
+/// 2^32 → 0 kbps) — ein kaputt konfigurierter/veralteter Client bekäme einen
+/// unbrauchbaren Stream statt eines klaren Werts. 1 Gbit/s deckt jedes reale
+/// Profil (Profile liegen bei 4000).
+fn clamp_bitrate(kbps: u64) -> u32 {
+    kbps.clamp(1, 1_000_000) as u32
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    use super::clamp_bitrate;
+
+    #[test]
+    fn clamps_instead_of_truncating() {
+        assert_eq!(clamp_bitrate(4000), 4000);
+        // Kein Modulo-Wrap: 2^32 darf nicht zu 0, 2^32+500 nicht zu 500 werden.
+        assert_eq!(clamp_bitrate(1 << 32), 1_000_000);
+        assert_eq!(clamp_bitrate((1 << 32) + 500), 1_000_000);
+        assert_eq!(clamp_bitrate(u64::MAX), 1_000_000);
+        // 0 ist kein sinnvoller Encoder-Wert.
+        assert_eq!(clamp_bitrate(0), 1);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

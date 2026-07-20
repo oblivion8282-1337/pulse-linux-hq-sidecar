@@ -19,6 +19,88 @@ use super::mux_writer::MuxSender;
 /// 20ms @48kHz = 960 Samples pro Kanal — der Standard-libopus-Frame.
 pub const OPUS_FRAME_SAMPLES: usize = 960;
 
+/// Ab dieser Abweichung zwischen Wanduhr-Anker und interner pts-Zeitlinie wird
+/// re-verankert (100 ms @48 kHz). Klein genug, dass hörbarer A/V-Versatz nach
+/// einer Capture-Lücke korrigiert wird; groß genug, dass FIFO-Restbestand und
+/// Batch-Jitter nie einen Sprung auslösen.
+const RESYNC_THRESHOLD_SAMPLES: i64 = 4800;
+
+/// Audio-pts-Zeitlinie: verankert den ersten Frame an der Stream-Wanduhr und
+/// RE-ankert nach Capture-Lücken. PipeWire liefert bei suspendiertem Node
+/// (Stille) nichts — zählte man danach stur weiter (`+960` pro Frame), liefe
+/// der Ton dem Video dauerhaft um exakt die Lückenlänge voraus.
+struct PtsTimeline {
+    out_pts: i64,
+    anchored: bool,
+}
+
+impl PtsTimeline {
+    fn new() -> Self {
+        Self { out_pts: 0, anchored: false }
+    }
+
+    /// `anchor_samples` = Wanduhr-Position des aktuellen Batches (Samples seit
+    /// Stream-Epoche). Liefert den pts für den nächsten Opus-Frame; springt
+    /// bei einer Lücke nach VORN, nie zurück (pts bleiben monoton).
+    fn align(&mut self, anchor_samples: i64) -> i64 {
+        let anchor = anchor_samples.max(0);
+        if !self.anchored {
+            self.out_pts = anchor;
+            self.anchored = true;
+        } else if anchor - self.out_pts > RESYNC_THRESHOLD_SAMPLES {
+            tracing::info!(
+                target: "audio",
+                gap_samples = anchor - self.out_pts,
+                "Capture-Lücke — Audio-pts re-verankert"
+            );
+            self.out_pts = anchor;
+        }
+        self.out_pts
+    }
+
+    /// Nach einem emittierten Frame weiterzählen.
+    fn advance(&mut self, samples: i64) {
+        self.out_pts += samples;
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::{OPUS_FRAME_SAMPLES, PtsTimeline, RESYNC_THRESHOLD_SAMPLES};
+
+    const FRAME: i64 = OPUS_FRAME_SAMPLES as i64;
+
+    #[test]
+    fn anchors_first_batch_and_ignores_jitter() {
+        let mut t = PtsTimeline::new();
+        assert_eq!(t.align(1000), 1000);
+        t.advance(FRAME);
+        // Kleiner Batch-Jitter (< Schwelle) darf NICHT springen.
+        assert_eq!(t.align(1000 + FRAME + 100), 1000 + FRAME);
+    }
+
+    /// Capture-Lücke (Node suspendiert): der Anker läuft der Zeitlinie weit
+    /// voraus → re-ankern, sonst ist der Ton dauerhaft um die Lücke versetzt.
+    #[test]
+    fn reanchors_after_capture_gap() {
+        let mut t = PtsTimeline::new();
+        t.align(0);
+        t.advance(FRAME);
+        let gap_anchor = FRAME + RESYNC_THRESHOLD_SAMPLES + 48_000; // ~1s Lücke
+        assert_eq!(t.align(gap_anchor), gap_anchor);
+    }
+
+    /// pts bleiben monoton: ein rückwärts laufender Anker (Capture eilt der
+    /// Wanduhr voraus) darf die Zeitlinie nie zurückdrehen.
+    #[test]
+    fn never_jumps_backwards() {
+        let mut t = PtsTimeline::new();
+        t.align(48_000);
+        t.advance(FRAME);
+        assert_eq!(t.align(0), 48_000 + FRAME);
+    }
+}
+
 pub struct AudioEncoder {
     encoder: codec::encoder::Audio,
     frame: frame::Audio,
@@ -28,10 +110,8 @@ pub struct AudioEncoder {
     stream_idx: usize,
     encoder_time_base: Rational,
     stream_time_base: Rational,
-    /// Output-pts in Samples (1/sample_rate-Einheiten).
-    out_pts: i64,
-    /// Ob der erste Frame-pts an die Stream-Epoche verankert wurde.
-    anchored: bool,
+    /// Output-pts-Zeitlinie (Samples, 1/sample_rate-Einheiten).
+    timeline: PtsTimeline,
 }
 
 impl AudioEncoder {
@@ -81,8 +161,7 @@ impl AudioEncoder {
             stream_idx,
             encoder_time_base: Rational::new(1, sample_rate as i32),
             stream_time_base: Rational::new(1, sample_rate as i32),
-            out_pts: 0,
-            anchored: false,
+            timeline: PtsTimeline::new(),
         })
     }
 
@@ -92,14 +171,11 @@ impl AudioEncoder {
     }
 
     /// Interleaved Stereo-Samples akkumulieren und volle 20ms-Opus-Frames
-    /// emittieren. `anchor_samples` verankert den ERSTEN Frame-pts an der
-    /// Stream-Wanduhr-Epoche (mit Video geteilt) — startet Audio-Capture später
-    /// als Video, wird seine Zeitlinie entsprechend versetzt statt bei 0.
+    /// emittieren. `anchor_samples` = Wanduhr-Position DIESES Batches (Samples
+    /// seit Stream-Epoche, mit Video geteilt) — verankert den ersten Frame-pts
+    /// und re-ankert nach Capture-Lücken (s. [`PtsTimeline`]).
     pub fn push(&mut self, samples: &[f32], mux: &MuxSender, anchor_samples: i64) -> Result<()> {
-        if !self.anchored {
-            self.out_pts = anchor_samples.max(0);
-            self.anchored = true;
-        }
+        let mut pts = self.timeline.align(anchor_samples);
         self.fifo.extend(samples.iter().copied());
         let chunk = OPUS_FRAME_SAMPLES * self.channels;
         while self.fifo.len() >= chunk {
@@ -111,8 +187,9 @@ impl AudioEncoder {
                     plane[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
                 }
             }
-            self.frame.set_pts(Some(self.out_pts));
-            self.out_pts += OPUS_FRAME_SAMPLES as i64;
+            self.frame.set_pts(Some(pts));
+            self.timeline.advance(OPUS_FRAME_SAMPLES as i64);
+            pts = self.timeline.out_pts;
             self.encoder.send_frame(&self.frame).context("audio send_frame")?;
             self.drain(mux)?;
         }

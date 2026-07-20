@@ -23,6 +23,7 @@ use ffmpeg::{Dictionary, Packet, Rational, codec, format, ffi::*};
 use audio::AudioEncoder;
 use hw::HwContext;
 use mux_writer::{MuxSender, MuxWriter};
+use crate::redact::redact_url;
 use crate::system::drm::Vendor;
 
 /// Optionale Audio-Konfiguration für [`VideoEncoder::create_with_audio`].
@@ -96,11 +97,16 @@ impl VideoEncoder {
                         o.set("tls_verify", "0"); // self-signed MediaMTX (GnuTLS honoriert das)
                     }
                 }
-                format::output_as_with(output_path, fmt, o)
-                    .with_context(|| format!("format::output_as_with({output_path}, {fmt})"))?
+                // Fehlerkontext IMMER über redact_url: `output_path` trägt das
+                // Stream-Token, und dieser anyhow-Kontext landet als
+                // Event::Error roh im stdio-Protokoll (Renderer-Banner) und
+                // auf stderr (sidecar.log) — Kontrakt in `redact.rs`.
+                format::output_as_with(output_path, fmt, o).with_context(|| {
+                    format!("format::output_as_with({}, {fmt})", redact_url(output_path))
+                })?
             }
             None => format::output(output_path)
-                .with_context(|| format!("format::output({output_path})"))?,
+                .with_context(|| format!("format::output({})", redact_url(output_path)))?,
         };
 
         let codec_name = opts::encoder_name(cfg.vendor, &cfg.codec)
@@ -262,11 +268,24 @@ pub fn probe_encoder(vendor: Vendor, render_node: &str, codec_id: &str) -> Resul
 
     // FFmpeg-Logs während der Probe dämpfen — ein fehlgeschlagener open loggt
     // sonst laute AV_LOG_ERROR-Zeilen in die sidecar.log, obwohl "geht nicht"
-    // hier der ERWARTETE Ausgang ist.
+    // hier der ERWARTETE Ausgang ist. `av_log_set_level` ist PROZESS-global:
+    // (a) parallele Proben serialisiert der Lock (sonst Race beim Restore —
+    // eine Probe könnte den FATAL-Wert der anderen als "prev" einfangen);
+    // (b) läuft gerade ein Stream, wird NICHT gedämpft — sonst fehlten genau
+    // während der Probe die Fehlerlogs eines parallelen Push-Problems.
+    static PROBE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialize = PROBE_LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let quiet = !crate::stream_controller::StreamController::singleton()
+        .state()
+        .running;
     let prev = unsafe { av_log_get_level() };
-    unsafe { av_log_set_level(AV_LOG_FATAL) };
+    if quiet {
+        unsafe { av_log_set_level(AV_LOG_FATAL) };
+    }
     let ok = probe_open(desc, &hwctx, vendor);
-    unsafe { av_log_set_level(prev) };
+    if quiet {
+        unsafe { av_log_set_level(prev) };
+    }
     Ok(ok)
 }
 
