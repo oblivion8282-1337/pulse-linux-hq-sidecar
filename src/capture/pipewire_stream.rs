@@ -366,8 +366,30 @@ fn run_pipewire(
 
     let _listener = stream
         .add_local_listener_with_user_data(data)
-        .state_changed(|_s, _ud, old, new| {
-            tracing::debug!(target: "pipewire", "PW-State: {old:?} -> {new:?}");
+        .state_changed({
+            let mainloop = mainloop.clone();
+            move |_s, _ud, old, new| {
+                tracing::debug!(target: "pipewire", "PW-State: {old:?} -> {new:?}");
+                // Quelle weg (gestreamtes Fenster geschlossen, Compositor trennt):
+                // Streaming/Paused → Unconnected oder Error. Mainloop beenden →
+                // Capture-Thread endet → frame_tx droppt → der Pacing-Loop sieht
+                // Disconnected und beendet den Stream sauber, statt das letzte
+                // Bild ewig zu duplizieren (Zuschauer-Standbild bei weiter
+                // „Live"). `Paused` selbst ist KEIN Ende (transient bei
+                // Neuverhandlung/Minimieren); der initiale Unconnected-Zustand
+                // (old = Connecting) auch nicht.
+                use pw::stream::StreamState as S;
+                let source_died = matches!(new, S::Error(_))
+                    || (matches!(new, S::Unconnected)
+                        && matches!(old, S::Streaming | S::Paused));
+                if source_died {
+                    tracing::warn!(
+                        target: "pipewire",
+                        "Stream-Quelle beendet ({old:?} -> {new:?}) — Capture endet"
+                    );
+                    mainloop.quit();
+                }
+            }
         })
         .param_changed(|s, ud, id, param| {
             tracing::debug!(target: "pipewire", "param_changed id={id} param={}", param.is_some());
