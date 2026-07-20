@@ -39,7 +39,6 @@ type FnQueryDevicesExt = unsafe extern "C" fn(i32, *mut EglDeviceExt, *mut i32) 
 type FnGetPlatformDisplayExt =
     unsafe extern "C" fn(u32, *mut c_void, *const i32) -> EglDisplay;
 type FnInitialize = unsafe extern "C" fn(EglDisplay, *mut i32, *mut i32) -> u32;
-type FnTerminate = unsafe extern "C" fn(EglDisplay) -> u32;
 type FnQueryString = unsafe extern "C" fn(EglDisplay, i32) -> *const c_char;
 type FnQueryDmaBufModifiersExt =
     unsafe extern "C" fn(EglDisplay, i32, i32, *mut u64, *mut u32, *mut i32) -> u32;
@@ -111,8 +110,6 @@ fn query_into(fourccs: &[u32], out: &mut HashMap<u32, Vec<u64>>) -> Result<(), S
             .map_err(|e| format!("eglGetProcAddress: {e}"))?;
         let initialize: libloading::Symbol<FnInitialize> =
             lib.get(b"eglInitialize\0").map_err(|e| format!("eglInitialize: {e}"))?;
-        let terminate: libloading::Symbol<FnTerminate> =
-            lib.get(b"eglTerminate\0").map_err(|e| format!("eglTerminate: {e}"))?;
         let query_string: libloading::Symbol<FnQueryString> =
             lib.get(b"eglQueryString\0").map_err(|e| format!("eglQueryString: {e}"))?;
 
@@ -176,7 +173,12 @@ fn query_into(fourccs: &[u32], out: &mut HashMap<u32, Vec<u64>>) -> Result<(), S
                     }
                 }
             }
-            terminate(dpy);
+            // KEIN eglTerminate: `eglGetPlatformDisplayEXT` liefert für dasselbe
+            // Device prozessweit DASSELBE Display-Handle, und EGL-Displays sind
+            // nicht refcounted — ein Terminate hier zerstörte die Contexts/Images
+            // eines parallel laufenden NVENC-Importers auf demselben Device.
+            // Initialisierte Displays bleiben stehen (bounded: eins pro GPU);
+            // eglInitialize auf einem initialisierten Display ist ein No-op.
         }
 
         if !any_display {

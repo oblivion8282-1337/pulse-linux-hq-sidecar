@@ -151,6 +151,11 @@ impl VaapiImporter {
             (*par).time_base = AVRational { num: 1, den: fps as i32 };
             (*par).hw_frames_ctx = av_buffer_ref(self.drm_frames);
             let r = av_buffersrc_parameters_set(src_ctx, par);
+            // parameters_set macht intern seine EIGENE Ref; av_free gibt nur
+            // die Param-Struct frei. Unsere Ref muss explizit weg — sonst hält
+            // sie den DRM-Frames-Ctx (und dessen Render-Node-fd) pro
+            // Stream-Start für immer fest.
+            av_buffer_unref(&mut (*par).hw_frames_ctx);
             av_free(par as *mut std::ffi::c_void);
             if r < 0 {
                 return Err(anyhow!("av_buffersrc_parameters_set failed (rc={r})"));

@@ -226,16 +226,16 @@ fn run_audio(
                 return;
             }
             let data = &mut datas[0];
+            let offset = data.chunk().offset() as usize;
             let size = data.chunk().size() as usize;
             if size == 0 {
                 return;
             }
             if let Some(bytes) = data.data() {
-                let n = size.min(bytes.len()) / std::mem::size_of::<f32>();
-                let samples: Vec<f32> = bytes[..n * 4]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
+                let samples = samples_from_chunk(bytes, offset, size);
+                if samples.is_empty() {
+                    return;
+                }
                 // Fehlt der Consumer, ist der Stream vorbei — Fehler ignorieren.
                 let _ = ud.sample_tx.send(samples);
             }
@@ -270,6 +270,51 @@ fn run_audio(
     mainloop.run();
     tracing::debug!(target: "audio", "Audio-Mainloop beendet (stop)");
     Ok(())
+}
+
+/// Gültigen Sample-Bereich aus einem SPA-Chunk schneiden und als F32LE
+/// dekodieren. `offset`/`size` kommen aus `chunk()` — der Server darf Buffers
+/// mit `offset != 0` liefern (SHM-Ringpuffer), der Ausschnitt beginnt dann
+/// NICHT bei Byte 0. Out-of-Range-Werte werden defensiv geclampt.
+fn samples_from_chunk(bytes: &[u8], offset: usize, size: usize) -> Vec<f32> {
+    let start = offset.min(bytes.len());
+    let end = start.saturating_add(size).min(bytes.len());
+    // chunks_exact(4) verwirft einen angebrochenen Rest-Sample selbst — kein
+    // manuelles Runden auf die f32-Grenze nötig.
+    bytes[start..end]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::samples_from_chunk;
+
+    fn le(vals: &[f32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn respects_chunk_offset() {
+        // Buffer: [garbage garbage | 1.0 2.0], Chunk sagt offset=8, size=8.
+        let mut bytes = le(&[9.9, 8.8, 1.0, 2.0]);
+        assert_eq!(samples_from_chunk(&bytes, 8, 8), vec![1.0, 2.0]);
+        // offset=0 bleibt wie gehabt.
+        bytes.truncate(8);
+        assert_eq!(samples_from_chunk(&bytes, 0, 8), vec![9.9, 8.8]);
+    }
+
+    #[test]
+    fn clamps_out_of_range_offset_and_size() {
+        let bytes = le(&[1.0, 2.0]);
+        // offset hinter dem Buffer → leer statt Panik.
+        assert!(samples_from_chunk(&bytes, 64, 8).is_empty());
+        // size über das Buffer-Ende hinaus → auf den Rest geclampt.
+        assert_eq!(samples_from_chunk(&bytes, 4, 999), vec![2.0]);
+        // krumme size → auf Sample-Grenze abgerundet.
+        assert_eq!(samples_from_chunk(&bytes, 0, 7), vec![1.0]);
+    }
 }
 
 #[cfg(test)]

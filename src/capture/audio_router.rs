@@ -329,19 +329,36 @@ pub fn list_applications() -> Result<Vec<String>> {
     // sync(0): der `done` kommt, nachdem der Server alle bestehenden Globals
     // geliefert hat → Mainloop beenden.
     let pending = core.sync(0).context("core sync")?;
+    let done = Rc::new(RefCell::new(false));
     let _cl = core
         .add_listener_local()
         .done({
             let mainloop = mainloop.clone();
+            let done = done.clone();
             move |_id, seq| {
                 if seq == pending {
+                    *done.borrow_mut() = true;
                     mainloop.quit();
                 }
             }
         })
         .register();
+    // Sicherheitsnetz: kommt der `done` nie (Daemon hängt/tot bei offenem
+    // Socket), bliebe `mainloop.run()` für immer stehen — und mit ihm die
+    // ganze RPC-Schleife des Sidecars.
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        move |_expirations| mainloop.quit()
+    });
+    timer
+        .update_timer(Some(std::time::Duration::from_secs(5)), None)
+        .into_result()
+        .context("timer armieren")?;
     mainloop.run();
 
+    if !*done.borrow() {
+        return Err(anyhow::anyhow!("PipeWire antwortet nicht (Timeout nach 5s)"));
+    }
     let out = names.borrow().iter().cloned().collect();
     Ok(out)
 }

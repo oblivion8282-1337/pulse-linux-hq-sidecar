@@ -158,14 +158,10 @@ impl HwContext {
             (*hw).format = self.kind.pix_fmt() as i32;
             (*hw).width = self.width;
             (*hw).height = self.height;
-            // Encoder braucht den Frames-Ctx am Frame.
-            let fc = av_buffer_ref(self.frames_ref);
-            if fc.is_null() {
-                av_frame_free(&mut hw);
-                return Err(anyhow!("av_buffer_ref(frames) returned NULL"));
-            }
-            (*hw).hw_frames_ctx = fc;
-
+            // hw_frames_ctx setzt av_hwframe_get_buffer SELBST (direkte
+            // Zuweisung einer frischen Ref, ohne eine vorhandene zu unref'en) —
+            // eine manuell vorgesetzte Ref hier leakte pro Frame und hielt den
+            // GPU-Frame-Pool (30+ MB VRAM) nach Stream-Ende für immer am Leben.
             let r = av_hwframe_get_buffer(self.frames_ref, hw, 0);
             if r < 0 {
                 av_frame_free(&mut hw);

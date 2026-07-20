@@ -14,6 +14,8 @@
 
 use std::os::fd::OwnedFd;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
@@ -71,7 +73,13 @@ struct SessionCloseGuard(#[allow(dead_code)] oneshot::Sender<()>);
 
 /// Verhandle eine ScreenCast-Session. Öffnet den Portal-Dialog (User wählt
 /// Quelle). `show_cursor=true` → Cursor eingebettet (Embedded), sonst Hidden.
-pub fn open(show_cursor: bool) -> Result<PortalSession> {
+///
+/// `cancel`: wird das Flag gesetzt (stop-Request/stdin-EOF), bricht die
+/// Verhandlung ab — der Portal-Dialog blockt sonst UNBEGRENZT, und `stop()`
+/// joint den Worker: die ganze RPC-Schleife (und der Prozess-Shutdown) hinge
+/// fest, bis der User den Dialog beantwortet. Abbruch wird als
+/// [`PortalCanceled`] gemeldet (Caller unterscheidet über sein Stop-Flag).
+pub fn open(show_cursor: bool, cancel: &AtomicBool) -> Result<PortalSession> {
     portal_runtime().block_on(async move {
         let sc: Screencast<'static> = Screencast::new()
             .await
@@ -81,7 +89,13 @@ pub fn open(show_cursor: bool) -> Result<PortalSession> {
             .await
             .map_err(|e| anyhow!("create_session: {e}"))?;
 
-        match negotiate(&sc, &session, show_cursor).await {
+        let negotiated = tokio::select! {
+            r = negotiate(&sc, &session, show_cursor) => r,
+            _ = wait_cancel(cancel) => {
+                Err(anyhow!(PortalCanceled).context("Verhandlung abgebrochen (stop)"))
+            }
+        };
+        match negotiated {
             Ok((pw_fd, node_id, width, height, restore_token)) => {
                 // Close-Task: lebt auf dem portal_runtime und wartet, bis der
                 // Guard (Sender) im PortalSession-Drop fällt — dann Session
@@ -114,6 +128,13 @@ pub fn open(show_cursor: bool) -> Result<PortalSession> {
     })
 }
 
+/// Pollt das Abbruch-Flag (100-ms-Raster reicht — es geht um Sekunden-Hänger).
+async fn wait_cancel(flag: &AtomicBool) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Die eigentliche Verhandlung (SelectSources → Start → OpenPipeWireRemote),
 /// getrennt von `open()`, damit der Fehlerpfad dort die Session schließen kann.
 /// Liefert (pw_fd, node_id, width, height, restore_token).
@@ -135,7 +156,12 @@ async fn negotiate(
         types,
         false, // multiple — einzelne Quelle
         None,  // restore_token (noch nicht persistiert)
-        PersistMode::ExplicitlyRevoked,
+        // Solange wir kein restore_token einlösen, NICHT persistieren:
+        // ExplicitlyRevoked ließe das Portal bei jedem Start einen neuen
+        // Permission-Eintrag anlegen, der nie wiederverwendet oder revoked
+        // wird — die akkumulieren im Portal-Store. Umstellen auf
+        // ExplicitlyRevoked, sobald der Settings-Store das Token speichert.
+        PersistMode::DoNot,
     )
     .await
     .map_err(|e| anyhow!("select_sources: {e}"))?
@@ -159,7 +185,11 @@ async fn negotiate(
         .first()
         .ok_or_else(|| anyhow!("Start lieferte keine Streams (User-Abbruch?)"))?;
     let node_id = first.pipe_wire_node_id();
-    let (w, h) = first.size().unwrap_or((0, 0));
+    // `size` ist im Portal-Protokoll optional; 0×0 läge außerhalb der
+    // VideoSize-Range (min 1×1) im EnumFormat-POD und kann die Verhandlung
+    // bei strengen Servern scheitern lassen — auf mindestens 1×1 clampen
+    // (die verbindliche Größe kommt ohnehin aus der Format-Verhandlung).
+    let (w, h) = first.size().map(|(w, h)| (w.max(1), h.max(1))).unwrap_or((1, 1));
     let restore_token = streams.restore_token().map(str::to_string);
 
     Ok((fd, node_id, w as u32, h as u32, restore_token))
@@ -167,15 +197,21 @@ async fn negotiate(
 
 /// ashpd meldet einen User-Abbruch als Error — wir wandeln das in einen
 /// Exit-60-markierten Fehler um (Caller wertet `is_portal_canceled` aus).
+/// Match über die Fehler-TYPEN, nicht über Display-Strings: der frühere
+/// `contains("response")`-Match klassifizierte jeden Backend-Fehler mit
+/// "response" im Text (z. B. `NoResponse` → "Portal error: no response") als
+/// User-Abbruch — der User sah dann gar keinen Fehler.
 fn cancel_or_err(step: &str, e: ashpd::Error) -> anyhow::Error {
-    let msg = format!("{e}");
-    if msg.to_ascii_lowercase().contains("cancelled")
-        || msg.to_ascii_lowercase().contains("canceled")
-        || msg.contains("response")
-    {
+    use ashpd::desktop::ResponseError;
+    let canceled = matches!(
+        e,
+        ashpd::Error::Response(ResponseError::Cancelled)
+            | ashpd::Error::Portal(ashpd::PortalError::Cancelled(_))
+    );
+    if canceled {
         anyhow!(PortalCanceled).context(format!("{step} abgebrochen"))
     } else {
-        anyhow!("{step}: {msg}")
+        anyhow!("{step}: {e}")
     }
 }
 
@@ -193,4 +229,28 @@ impl std::error::Error for PortalCanceled {}
 /// True wenn der Fehler ein User-Abbruch des Portal-Dialogs ist.
 pub fn is_portal_canceled(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<PortalCanceled>().is_some())
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use ashpd::desktop::ResponseError;
+
+    #[test]
+    fn user_cancel_is_marked_as_canceled() {
+        let e = cancel_or_err("start", ashpd::Error::Response(ResponseError::Cancelled));
+        assert!(is_portal_canceled(&e));
+    }
+
+    /// Echte Portal-Fehler dürfen NICHT als User-Abbruch (Exit 60) durchgehen —
+    /// sonst sieht der User bei einem kaputten Portal-Backend keinerlei Fehler.
+    /// `NoResponse` rendert als "Portal error: no response" und triggert den
+    /// alten `contains("response")`-Match fälschlich.
+    #[test]
+    fn backend_errors_are_not_cancel() {
+        let e = cancel_or_err("start", ashpd::Error::NoResponse);
+        assert!(!is_portal_canceled(&e), "NoResponse ist ein Backend-Fehler, kein Abbruch: {e:#}");
+        let e = cancel_or_err("start", ashpd::Error::Response(ResponseError::Other));
+        assert!(!is_portal_canceled(&e), "ResponseError::Other ist kein User-Abbruch: {e:#}");
+    }
 }

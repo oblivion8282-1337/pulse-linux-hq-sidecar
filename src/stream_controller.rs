@@ -85,22 +85,18 @@ impl AudioPipeline {
         let worker = thread::Builder::new()
             .name("hq-audio-encode".into())
             .spawn(move || {
-                // Der erste Sample-Batch verankert die Audio-Zeitlinie: sein
-                // Empfangszeitpunkt relativ zu record_start (in Samples) wird
-                // der pts des ersten Opus-Frames. So beginnt Audio bei genau der
-                // Video-Zeit, zu der es wirklich einsetzt — kein fixer Offset
-                // (GSR schaltet den bei Livestream auch ab: force_no_audio_offset).
+                // Jeder Sample-Batch trägt seine Wanduhr-Position relativ zu
+                // record_start (in Samples) als Anker: der erste verankert die
+                // Audio-Zeitlinie (Audio beginnt bei genau der Video-Zeit, zu
+                // der es wirklich einsetzt — kein fixer Offset; GSR schaltet
+                // den bei Livestream auch ab: force_no_audio_offset), spätere
+                // lassen `PtsTimeline` Capture-Lücken erkennen und re-ankern.
                 let offset_samples =
                     av_offset_ms as i64 * audio::SAMPLE_RATE as i64 / 1000;
-                let mut anchored = false;
                 while let Ok(samples) = rx.recv() {
-                    let anchor = if anchored {
-                        0 // nach dem ersten push ignoriert AudioEncoder den Wert
-                    } else {
-                        anchored = true;
-                        let elapsed = record_start.elapsed().as_secs_f64();
-                        (elapsed * audio::SAMPLE_RATE as f64) as i64 + offset_samples
-                    };
+                    let elapsed = record_start.elapsed().as_secs_f64();
+                    let anchor =
+                        (elapsed * audio::SAMPLE_RATE as f64) as i64 + offset_samples;
                     if let Err(e) = enc.push(&samples, &mux, anchor) {
                         emit(Event::Log { line: format!("[audio] push: {e:#}") });
                         break;
@@ -242,6 +238,10 @@ struct Shared {
     live: AtomicBool,
     fps_milli: AtomicU64,
     started_at: Mutex<Option<Instant>>,
+    /// Von `stop()` gesetzt, BEVOR das Stop-Signal gesendet wird. Die
+    /// Startphase (Portal-Dialog) pollt dieses Flag — der `stop_rx`-Channel
+    /// hilft dort nicht, weil `portal::open` async blockt.
+    stop_requested: AtomicBool,
 }
 
 struct Active {
@@ -273,6 +273,62 @@ fn emit(event: Event) {
     }
     if let Ok(v) = serde_json::to_value(event) {
         events::emit(v);
+    }
+}
+
+/// Drop-Guard im Worker-Thread: setzt die Shared-Flags auch dann zurück, wenn
+/// der Worker PANICT (Unwind läuft am regulären Pfad vorbei). Ohne das bliebe
+/// `running = true` stehen — `reap_finished` griffe nie, `state` meldete ewig
+/// "starting", jeder neue `start` scheiterte mit "ein Stream läuft bereits",
+/// und der Parent bekäme weder `error` noch `stopped`.
+struct WorkerDoneGuard(Arc<Shared>);
+
+impl Drop for WorkerDoneGuard {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
+        self.0.live.store(false, Ordering::SeqCst);
+        if thread::panicking() {
+            // `emit` ist panic-sicher (no-op ohne Init, kein Lock-Panic) —
+            // der Parent bekommt so auch bei einem Absturz error + stopped.
+            emit(Event::Error {
+                message: "Stream-Worker abgestürzt (Panic) — Details in sidecar.log".to_string(),
+            });
+            emit(Event::State { state: StreamState::Error, running: false, uptime_s: 0.0 });
+            emit(Event::Stopped { code: None });
+        }
+    }
+}
+
+/// Wartet auf den ersten Capture-Frame — bricht aber sofort ab, wenn `stop`
+/// signalisiert wird (`Ok(None)`). Vorher blockte die Startphase hier bis zu
+/// 10 s, ohne den Stop zu sehen: `stop()` joint den Worker, d. h. die gesamte
+/// RPC-Schleife (und der Shutdown bei stdin-EOF) hing solange fest.
+fn wait_first_frame(
+    rx: &Receiver<DmabufFrame>,
+    stop_rx: &Receiver<()>,
+    timeout: Duration,
+) -> Result<Option<DmabufFrame>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match stop_rx.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => return Ok(None),
+            Err(TryRecvError::Empty) => {}
+        }
+        let slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        match rx.recv_timeout(slice) {
+            Ok(f) => return Ok(Some(f)),
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow!("kein Bild vom Compositor in 10s (ist die Quelle sichtbar?)"));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("Capture-Thread beendet, bevor ein Frame kam"));
+            }
+        }
     }
 }
 
@@ -315,11 +371,14 @@ impl StreamController {
             live: AtomicBool::new(false),
             fps_milli: AtomicU64::new(0),
             started_at: Mutex::new(None),
+            stop_requested: AtomicBool::new(false),
         });
         let shared_worker = shared.clone();
         let worker = thread::Builder::new()
             .name("hq-stream".into())
             .spawn(move || {
+                // Räumt die Flags auch bei Panic (Unwind) ab — s. WorkerDoneGuard.
+                let _done = WorkerDoneGuard(shared_worker.clone());
                 let result = run_stream(params, stop_rx, &shared_worker);
                 shared_worker.running.store(false, Ordering::SeqCst);
                 shared_worker.live.store(false, Ordering::SeqCst);
@@ -348,6 +407,9 @@ impl StreamController {
     pub fn stop(&self) -> Result<()> {
         let active = self.active.lock().unwrap().take();
         if let Some(active) = active {
+            // Flag ZUERST: die Startphase (Portal-Dialog/First-Frame-Wait)
+            // sieht nur das Flag, nicht den Channel.
+            active.shared.stop_requested.store(true, Ordering::SeqCst);
             let _ = active.stop_tx.send(());
             let _ = active.worker.join();
         }
@@ -409,13 +471,15 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     emit(Event::Log {
         line: "[stream] öffne Portal-Dialog zur Quellenauswahl …".to_string(),
     });
-    let session = portal::open(params.show_cursor).map_err(|e| {
-        if portal::is_portal_canceled(&e) {
-            anyhow!("Quellenauswahl abgebrochen")
-        } else {
-            anyhow!("Portal-Verhandlung: {e:#}")
+    let session = match portal::open(params.show_cursor, &shared.stop_requested) {
+        Ok(s) => s,
+        // stop während des Dialogs = kein Fehler — sauber beenden.
+        Err(_) if shared.stop_requested.load(Ordering::SeqCst) => return Ok(()),
+        Err(e) if portal::is_portal_canceled(&e) => {
+            return Err(anyhow!("Quellenauswahl abgebrochen"));
         }
-    })?;
+        Err(e) => return Err(anyhow!("Portal-Verhandlung: {e:#}")),
+    };
     emit(Event::Log {
         line: format!(
             "[stream] Quelle gewählt: node={} {}x{}",
@@ -432,9 +496,11 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     )?;
 
     // 3) Auf den ersten DMABUF-Frame warten → verbindliche (negotiierte) Maße.
-    let first = rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| anyhow!("kein Bild vom Compositor in 10s (ist die Quelle sichtbar?)"))?;
+    //    Stop-abbrechbar: `stop()` joint den Worker — bliebe das Warten blind
+    //    für den Stop, hinge die ganze RPC-Schleife bis zu 10 s fest.
+    let Some(first) = wait_first_frame(&rx, &stop_rx, Duration::from_secs(10))? else {
+        return Ok(()); // stop während der Startphase → sauber beenden
+    };
     let (width, height) = (first.width, first.height);
 
     // Ausgabe-Auflösung: gewünschte Box aspektwahrend auf die native Größe
@@ -553,16 +619,16 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             }
         }
     }
-    // close_planes auch im Fehlerfall — sonst leaken die DMABUF-fds des ersten
-    // Frames und halten GPU-Puffer fest (schlimm genau dann, wenn die GPU eh
-    // schon in Speichernot ist und der User mehrfach neu startet).
+    // `first` droppt am Blockende bzw. beim Early-Return — die Plane-fds
+    // schließen sich selbst (Drop) und geben den GPU-Puffer frei (wichtig
+    // genau dann, wenn die GPU eh schon in Speichernot ist und der User
+    // mehrfach neu startet).
     let Some((vendor, node, mut importer, mut last_hw)) = chosen else {
-        close_planes(&first);
         return Err(
             last_err.unwrap_or_else(|| anyhow!("kein GPU-Importer für den aufgenommenen Buffer"))
         );
     };
-    close_planes(&first);
+    drop(first);
     emit(Event::Log {
         line: format!(
             "[stream] Encode-Pfad: {} auf {}",
@@ -652,14 +718,13 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
 
             // Alle seit dem letzten Tick eingetroffenen Frames abholen, nur den
             // neuesten behalten (Damage kann mehrere geliefert haben; ältere
-            // wären ohnehin veraltet). fds der verworfenen Frames schließen.
+            // wären ohnehin veraltet). Verworfene Frames schließen ihre fds
+            // selbst (Plane-Drop).
             let mut newest: Option<DmabufFrame> = None;
             loop {
                 match rx.try_recv() {
                     Ok(f) => {
-                        if let Some(old) = newest.replace(f) {
-                            close_planes(&old);
-                        }
+                        let _ = newest.replace(f);
                     }
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
@@ -674,7 +739,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
                         line: format!("[stream] Frame-Import übersprungen: {e:#}"),
                     }),
                 }
-                close_planes(&frame);
+                // frame droppt hier → Plane-fds zu.
             }
 
             // Video-pts aus DERSELBEN Uhr wie der Audio-Anker ableiten (GSR:
@@ -749,6 +814,59 @@ fn display_node(node: &str) -> &str {
 }
 
 #[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn fresh_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            running: AtomicBool::new(true),
+            live: AtomicBool::new(true),
+            fps_milli: AtomicU64::new(0),
+            started_at: Mutex::new(None),
+            stop_requested: AtomicBool::new(false),
+        })
+    }
+
+    /// Panict der Worker, muss der Guard `running`/`live` zurücksetzen — sonst
+    /// hängt der Controller für immer in "ein Stream läuft bereits".
+    #[test]
+    fn worker_panic_clears_running_flag() {
+        let shared = fresh_shared();
+        let s2 = shared.clone();
+        let h = thread::spawn(move || {
+            let _guard = WorkerDoneGuard(s2);
+            panic!("boom (Test)");
+        });
+        assert!(h.join().is_err());
+        assert!(!shared.running.load(Ordering::SeqCst), "running muss nach Panic false sein");
+        assert!(!shared.live.load(Ordering::SeqCst), "live muss nach Panic false sein");
+    }
+
+    /// `stop` während des Wartens auf den ersten Frame muss SOFORT abbrechen
+    /// (Ok(None)), nicht erst nach dem vollen Timeout.
+    #[test]
+    fn wait_first_frame_aborts_on_stop() {
+        let (_frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(1);
+        let (stop_tx, stop_rx) = channel::<()>();
+        stop_tx.send(()).unwrap();
+        let t0 = Instant::now();
+        let r = wait_first_frame(&frame_rx, &stop_rx, Duration::from_secs(10)).unwrap();
+        assert!(r.is_none(), "Stop muss Ok(None) liefern");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "Stop muss sofort greifen, nicht erst nach dem Timeout"
+        );
+    }
+
+    #[test]
+    fn wait_first_frame_times_out_without_frame() {
+        let (_frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(1);
+        let (_stop_tx, stop_rx) = channel::<()>();
+        assert!(wait_first_frame(&frame_rx, &stop_rx, Duration::from_millis(200)).is_err());
+    }
+}
+
+#[cfg(test)]
 mod candidate_tests {
     use super::*;
 
@@ -791,12 +909,5 @@ mod candidate_tests {
             candidate_nodes(&[Vendor::Nvidia], &[]),
             vec![(Vendor::Nvidia, String::new())]
         );
-    }
-}
-
-/// DMABUF-fds eines Frames schließen (wir besitzen die dup'ten fds).
-fn close_planes(f: &DmabufFrame) {
-    for p in &f.planes {
-        unsafe { libc::close(p.fd) };
     }
 }
