@@ -48,7 +48,7 @@ fn main() {
 
     eprintln!("[capture_smoke] warte auf {n_frames} DMABUF-Frames …");
     for i in 0..n_frames {
-        match rx.recv() {
+        match rx.wait_take(std::time::Duration::from_secs(60)).and_then(|o| o.ok_or_else(|| anyhow::anyhow!("kein Frame in 60s"))) {
             Ok(f) => {
                 let planes: Vec<String> = f
                     .planes

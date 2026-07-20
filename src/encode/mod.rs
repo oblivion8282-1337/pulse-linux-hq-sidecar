@@ -93,6 +93,11 @@ impl VideoEncoder {
                     o.set("handshake_timeout", "10000");
                 } else {
                     o.set("rw_timeout", "10000000"); // 10s — sonst blockt ein toter Socket ewig
+                    // Stirbt der Audio-Pfad mid-stream (Track angekündigt,
+                    // aber keine Pakete mehr), hält av_interleaved_write_frame
+                    // Video sonst bis zum Default-Delta (10 s!) zurück —
+                    // 1 s begrenzt den Schaden auf leichte Zusatz-Latenz.
+                    o.set("max_interleave_delta", "1000000");
                     if output_path.to_ascii_lowercase().starts_with("rtmps://") {
                         o.set("tls_verify", "0"); // self-signed MediaMTX (GnuTLS honoriert das)
                     }
@@ -156,14 +161,23 @@ impl VideoEncoder {
         stream.set_parameters(&opened);
 
         // Audio-Stream VOR write_header hinzufügen (der Video-Stream-Borrow ist
-        // nach set_parameters freigegeben).
-        let mut audio_enc = audio
-            .as_ref()
-            .map(|a| {
-                AudioEncoder::create(&mut output, a.sample_rate, a.bitrate_kbps)
-                    .context("create audio encoder")
-            })
-            .transpose()?;
+        // nach set_parameters freigegeben). Scheitert der Audio-Encoder
+        // (libopus fehlt/Open-Fehler), läuft der Stream VIDEO-ONLY weiter —
+        // ein reines Audio-Problem darf das HQ-Streaming nicht killen. Der
+        // Track wird dann gar nicht erst angekündigt (ein deklarierter, aber
+        // stummer Track ließe den Interleave-Muxer puffern).
+        let mut audio_enc = audio.as_ref().and_then(|a| {
+            match AudioEncoder::create(&mut output, a.sample_rate, a.bitrate_kbps) {
+                Ok(enc) => Some(enc),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "stream",
+                        "Audio-Encoder nicht verfügbar ({e:#}) — Stream läuft ohne Ton"
+                    );
+                    None
+                }
+            }
+        });
 
         output.write_header().context("write_header")?;
 
@@ -200,7 +214,19 @@ impl VideoEncoder {
     pub fn send_hw(&mut self, frame: *mut AVFrame, pts: i64) -> Result<()> {
         unsafe {
             (*frame).pts = pts;
-            let ret = avcodec_send_frame(self.encoder.as_mut_ptr(), frame);
+            let mut ret = avcodec_send_frame(self.encoder.as_mut_ptr(), frame);
+            if ret == AVERROR(libc::EAGAIN) {
+                // Encoder-Input voll (kleiner NVENC-Surface-Pool / VAAPI
+                // async_depth) — laut send/receive-Kontrakt KEIN Fehler:
+                // erst drainen, dann genau einmal nachschieben. Bleibt es
+                // EAGAIN, wird der Frame verworfen (CFR dupliziert eh).
+                self.drain_video()?;
+                ret = avcodec_send_frame(self.encoder.as_mut_ptr(), frame);
+                if ret == AVERROR(libc::EAGAIN) {
+                    tracing::debug!(target: "stream", "Encoder-Queue voll — Frame übersprungen");
+                    return Ok(());
+                }
+            }
             if ret < 0 {
                 return Err(anyhow!("avcodec_send_frame failed (rc={ret})"));
             }

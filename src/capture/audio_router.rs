@@ -41,10 +41,16 @@ pub enum RouteMode {
 }
 
 impl RouteMode {
-    fn matches(&self, app: &str) -> bool {
+    /// Entscheidet über `application.name` UND `node.name`. Der Echo-Schutz
+    /// hängt an `node.name` („Pulse", via PULSE_PROP in Electron-main gesetzt)
+    /// — Electron trägt als `application.name` aber „Chromium": ein Match nur
+    /// über den App-Namen ließe Pulses eigene Voice-Wiedergabe in den Stream
+    /// (genau das Echo, das der Exclude verhindern soll).
+    fn matches(&self, app: &str, node: &str) -> bool {
+        let hits = |n: &str| n.eq_ignore_ascii_case(app) || n.eq_ignore_ascii_case(node);
         match self {
-            RouteMode::All { exclude } => !exclude.iter().any(|e| e.eq_ignore_ascii_case(app)),
-            RouteMode::App { name } => name.eq_ignore_ascii_case(app),
+            RouteMode::All { exclude } => !exclude.iter().any(|e| hits(e)),
+            RouteMode::App { name } => hits(name),
         }
     }
 }
@@ -54,13 +60,20 @@ struct PortInfo {
     channel: String,
 }
 
+/// Beide Namens-Properties eines App-Stream-Nodes — der Exclude-/App-Match
+/// muss BEIDE sehen (s. `RouteMode::matches`).
+struct AppNames {
+    app: String,
+    node: String,
+}
+
 #[derive(Default)]
 struct State {
     sink_node_id: Option<u32>,
     /// Input-Ports unseres Null-Sinks: (audio.channel, Port-Global-Id).
     sink_ports: Vec<(String, u32)>,
-    /// App-Stream-Nodes: Node-Global-Id → App-Name.
-    app_nodes: HashMap<u32, String>,
+    /// App-Stream-Nodes: Node-Global-Id → (application.name, node.name).
+    app_nodes: HashMap<u32, AppNames>,
     /// Output-Audio-Ports pro App-Node.
     out_ports: HashMap<u32, Vec<PortInfo>>,
     /// Aktive Links (Out-Port, In-Port) → Proxy (Drop = Link weg).
@@ -140,9 +153,15 @@ fn on_global(
                 if props.get("node.name") == Some(sink_name) {
                     st.sink_node_id = Some(g.id);
                 } else if props.get("media.class") == Some("Stream/Output/Audio") {
-                    let name = app_name_of(props).unwrap_or_default();
-                    tracing::debug!(target: "audio", id = g.id, name, "App-Audio-Stream erschienen");
-                    st.app_nodes.insert(g.id, name);
+                    let names = AppNames {
+                        app: app_name_of(props).unwrap_or_default(),
+                        node: props.get("node.name").unwrap_or_default().to_string(),
+                    };
+                    tracing::debug!(
+                        target: "audio", id = g.id, app = names.app, node = names.node,
+                        "App-Audio-Stream erschienen"
+                    );
+                    st.app_nodes.insert(g.id, names);
                 } else {
                     return;
                 }
@@ -195,7 +214,7 @@ fn ensure_links(core: &CoreRc, st: &mut State, mode: &RouteMode) {
     let candidates: Vec<(u32, Vec<(u32, String)>)> = st
         .app_nodes
         .iter()
-        .filter(|(_, name)| mode.matches(name))
+        .filter(|(_, names)| mode.matches(&names.app, &names.node))
         .filter_map(|(&nid, _)| {
             st.out_ports
                 .get(&nid)
@@ -361,4 +380,27 @@ pub fn list_applications() -> Result<Vec<String>> {
     }
     let out = names.borrow().iter().cloned().collect();
     Ok(out)
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::RouteMode;
+
+    /// Der Echo-Schutz-Fall: Electron meldet application.name="Chromium",
+    /// aber node.name="Pulse" (PULSE_PROP). Der Exclude "Pulse" MUSS greifen.
+    #[test]
+    fn exclude_matches_node_name_too() {
+        let all = RouteMode::All { exclude: vec!["Pulse".into()] };
+        assert!(!all.matches("Chromium", "Pulse"), "node.name=Pulse muss excluded sein");
+        assert!(!all.matches("Pulse", "whatever"), "application.name=Pulse ebenso");
+        assert!(all.matches("Firefox", "firefox-bin"), "fremde Apps bleiben drin");
+    }
+
+    #[test]
+    fn app_mode_matches_either_name() {
+        let app = RouteMode::App { name: "Firefox".into() };
+        assert!(app.matches("Firefox", "node-x"));
+        assert!(app.matches("something", "firefox"), "case-insensitiv über node.name");
+        assert!(!app.matches("Chromium", "chrome"));
+    }
 }

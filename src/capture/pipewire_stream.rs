@@ -18,12 +18,13 @@
 //!
 //! Threading: libpipewire ist pro-Mainloop single-threaded und pipewire-rs
 //! nutzt `Rc` (nicht `Send`) → MainLoop+Context+Core+Stream leben auf EINEM
-//! Worker-Thread; nach außen geht nur der `mpsc::Receiver<DmabufFrame>` (Send).
+//! Worker-Thread; nach außen geht nur die [`FrameMailbox`] (Send).
 
 use std::io::Cursor;
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use drm_fourcc::DrmFourcc;
 use pipewire as pw;
@@ -84,17 +85,22 @@ pub struct DmabufFrame {
 
 /// User-Daten für die Stream-Listener (auf dem Worker-Thread).
 struct StreamData {
-    frame_tx: SyncSender<DmabufFrame>,
+    frame_tx: FrameSender,
     width: u32,
     height: u32,
     drm_fourcc: u32,
     modifier: u64,
     /// Serialisierte EnumFormat-PODs — für den Re-Announce beim Fixieren.
     enum_format_bytes: Vec<Vec<u8>>,
-    /// Bereits als fixiert announcter Modifier (Schleifen-Guard: schickt der
-    /// Server danach weiter ein Choice, akzeptieren wir den Default statt
-    /// endlos zu re-announcen).
-    announced_modifier: Option<i64>,
+    /// Bereits ERFOLGREICH announctes (Format, Modifier)-Paar (Schleifen-
+    /// Guard: schickt der Server danach weiter ein Choice, akzeptieren wir
+    /// den Default statt endlos zu re-announcen). Erst nach geglücktem
+    /// `update_params` gesetzt (sonst gälte ein fehlgeschlagener Announce als
+    /// erledigt), nach empfangenem FIXIERTEN Format zurückgesetzt (jede echte
+    /// Neuverhandlung — Resize, Buffer-Neuaufbau — bekommt ihren eigenen
+    /// DONT_FIXATE-Tanz), und pro FORMAT gekeyt (BGRx→BGRA mit gleichem
+    /// Default-Modifier ist eine neue Verhandlung).
+    announced: Option<(u32, i64)>,
     shm_warned: bool,
     /// Buffer-Generation für den Importer-Cache (s. `DmabufFrame::epoch`).
     epoch: u64,
@@ -117,6 +123,97 @@ fn buffer_key_of(planes: impl Iterator<Item = (i32, u32)>) -> u64 {
     if h == 0 { 1 } else { h }
 }
 
+/// Ein-Slot-Übergabe Capture→Encode („latest wins"): der Producer ersetzt den
+/// Slot (der alte Frame droppt → fds zu), der Consumer nimmt immer den
+/// NEUESTEN Frame. Ersetzt den früheren FIFO-Kanal: bei gestautem Consumer
+/// sammelte der die ERSTEN Frames des Staus und verwarf die neuen — nach dem
+/// Stall klebte der Stream auf dem Stall-Anfangs-Bild bis zum nächsten
+/// Damage-Event. `closed` signalisiert das Capture-Ende (Quelle weg).
+pub struct FrameMailbox {
+    slot: Mutex<MailboxState>,
+    cond: Condvar,
+}
+
+struct MailboxState {
+    frame: Option<DmabufFrame>,
+    closed: bool,
+}
+
+impl FrameMailbox {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(MailboxState { frame: None, closed: false }),
+            cond: Condvar::new(),
+        })
+    }
+
+    /// Neuesten Frame einlegen; ein noch liegender älterer droppt (fds zu).
+    pub fn put(&self, f: DmabufFrame) {
+        let mut st = self.slot.lock().unwrap();
+        let _ = st.frame.replace(f);
+        drop(st);
+        self.cond.notify_one();
+    }
+
+    /// Neuesten Frame nehmen. `Ok(None)` = (noch) kein neuer Frame;
+    /// `Err` = Capture-Quelle weg (geschlossen und leer) — der Stream muss
+    /// enden, statt das letzte Bild ewig zu duplizieren.
+    pub fn take(&self) -> anyhow::Result<Option<DmabufFrame>> {
+        let mut st = self.slot.lock().unwrap();
+        match st.frame.take() {
+            Some(f) => Ok(Some(f)),
+            None if st.closed => Err(anyhow::anyhow!(
+                "Capture-Quelle beendet (gestreamtes Fenster geschlossen?)"
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Wie `take`, wartet aber bis zu `slice` blockierend auf einen Frame
+    /// (für die Startphase; der Caller sliced und prüft dazwischen sein
+    /// Stop-Signal).
+    pub fn wait_take(&self, slice: Duration) -> anyhow::Result<Option<DmabufFrame>> {
+        let deadline = Instant::now() + slice;
+        let mut st = self.slot.lock().unwrap();
+        loop {
+            if let Some(f) = st.frame.take() {
+                return Ok(Some(f));
+            }
+            if st.closed {
+                return Err(anyhow::anyhow!("Capture-Thread beendet, bevor ein Frame kam"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (guard, _timeout) = self.cond.wait_timeout(st, remaining).unwrap();
+            st = guard;
+        }
+    }
+
+    /// Capture-Ende signalisieren (Producer weg).
+    pub fn close(&self) {
+        self.slot.lock().unwrap().closed = true;
+        self.cond.notify_all();
+    }
+}
+
+/// Producer-Seite der Mailbox — Drop schließt sie (Capture-Thread endet,
+/// egal auf welchem Pfad).
+pub struct FrameSender(Arc<FrameMailbox>);
+
+impl FrameSender {
+    pub fn put(&self, f: DmabufFrame) {
+        self.0.put(f);
+    }
+}
+
+impl Drop for FrameSender {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// PipeWire-Capture-Session. `stop` beendet den Worker-Thread.
 pub struct PipewireCapture {
     /// pw::channel — weckt den Mainloop cross-thread (mpsc könnte das nicht:
@@ -128,13 +225,17 @@ pub struct PipewireCapture {
 impl PipewireCapture {
     /// Starte den Capture-Worker. `pw_fd` vom Portal (`open_pipewire_remote`),
     /// `node_id` vom Portal-`Start`.
-    pub fn start(pw_fd: OwnedFd, node_id: u32, width: u32, height: u32) -> anyhow::Result<(Receiver<DmabufFrame>, Self)> {
-        // Bounded: stallt der Consumer (RTMPS-Backpressure, Encoder hängt),
-        // dürfen sich nicht unbegrenzt Frames mit je 1–4 dup'ten DMABUF-fds
-        // stapeln (EMFILE). `try_send` im process-Callback verwirft dann den
-        // ältesten Zustand nicht — der neue Frame droppt (fds schließen sich)
-        // und der Consumer holt beim nächsten Drain den letzten gequeue'ten.
-        let (frame_tx, frame_rx) = sync_channel::<DmabufFrame>(8);
+    pub fn start(
+        pw_fd: OwnedFd,
+        node_id: u32,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(Arc<FrameMailbox>, Self)> {
+        // Ein-Slot-Mailbox statt Kanal: bounded (max 1 Frame + 1 in-flight →
+        // kein EMFILE bei Backpressure) UND „latest wins" (der Consumer sieht
+        // nach einem Stall den NEUESTEN Stand, nicht den Stall-Anfang).
+        let mailbox = FrameMailbox::new();
+        let frame_tx = FrameSender(mailbox.clone());
         let (stop_tx, stop_rx) = pw::channel::channel::<()>();
 
         let worker = thread::Builder::new()
@@ -144,7 +245,7 @@ impl PipewireCapture {
                     tracing::error!(target: "pipewire", "Capture-Thread: {e:#}");
                 }
             })?;
-        Ok((frame_rx, Self { stop_tx, worker: Some(worker) }))
+        Ok((mailbox, Self { stop_tx, worker: Some(worker) }))
     }
 
     /// Stoppe den Worker (Mainloop-quit + join). Schließt die
@@ -248,6 +349,19 @@ enum ModifierState {
     Unfixated(i64),
 }
 
+/// Roh-Wert der `SPA_FORMAT_VIDEO_format`-Property (fürs Announce-Guard-Keying
+/// pro Format; 0 = nicht gefunden).
+fn video_format_raw(properties: &[Property]) -> u32 {
+    properties
+        .iter()
+        .find(|p| p.key == spa::sys::SPA_FORMAT_VIDEO_format)
+        .and_then(|p| match &p.value {
+            Value::Id(v) => Some(v.0),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 fn modifier_state(properties: &[Property]) -> ModifierState {
     let Some(prop) = properties
         .iter()
@@ -295,7 +409,7 @@ fn run_pipewire(
     node_id: u32,
     width: u32,
     height: u32,
-    frame_tx: SyncSender<DmabufFrame>,
+    frame_tx: FrameSender,
     stop_rx: pw::channel::Receiver<()>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -349,7 +463,7 @@ fn run_pipewire(
         drm_fourcc: 0,
         modifier: 0,
         enum_format_bytes: enum_format_bytes.clone(),
-        announced_modifier: None,
+        announced: None,
         shm_warned: false,
         epoch: 0,
     };
@@ -412,12 +526,15 @@ fn run_pipewire(
             // None-Choice serialisiertes Echo), akzeptieren wir den Default
             // statt endlos zu re-announcen.
             let state = modifier_state(&obj.properties);
+            let announce_key = (video_format_raw(&obj.properties), match state {
+                ModifierState::Unfixated(d) => d,
+                _ => 0,
+            });
             let (has_modifier, modifier) = match state {
                 ModifierState::Absent => (false, 0i64),
                 ModifierState::Fixed(v) => (true, v),
                 ModifierState::Unfixated(default) => {
-                    if ud.announced_modifier != Some(default) {
-                        ud.announced_modifier = Some(default);
+                    if ud.announced != Some(announce_key) {
                         tracing::debug!(
                             target: "pipewire",
                             "Format mit Modifier-Choice → fixiere auf {default:#018x}"
@@ -445,10 +562,16 @@ fn run_pipewire(
                         pods.extend(
                             ud.enum_format_bytes.iter().filter_map(|b| Pod::from_bytes(b)),
                         );
-                        if let Err(e) = s.update_params(&mut pods) {
-                            // Verhandlung bliebe sonst still stehen (kein Frame,
-                            // kein Fehler) — mindestens die Diagnose loggen.
-                            tracing::warn!(target: "pipewire", "update_params (Fixierung) fehlgeschlagen: {e}");
+                        match s.update_params(&mut pods) {
+                            // Guard erst NACH Erfolg scharf — sonst gälte ein
+                            // fehlgeschlagener Announce als erledigt und der
+                            // nächste Choice-Durchlauf akzeptierte einen
+                            // Default, den der Server nie fixiert bekam.
+                            Ok(()) => ud.announced = Some(announce_key),
+                            Err(e) => tracing::warn!(
+                                target: "pipewire",
+                                "update_params (Fixierung) fehlgeschlagen: {e}"
+                            ),
                         }
                         return;
                     }
@@ -461,13 +584,17 @@ fn run_pipewire(
             };
 
             // Fixiertes Format: echte Größe/Format/Modifier übernehmen.
-            // Neuverhandlung = neue Buffer → Importer-Cache-Epoche wechseln.
-            ud.epoch += 1;
             let mut info = VideoInfoRaw::new();
             if info.parse(param).is_err() {
                 tracing::warn!(target: "pipewire", "Format-Parse fehlgeschlagen");
                 return;
             }
+            // Erst NACH erfolgreichem Parse: Guard zurücksetzen (die nächste
+            // echte Neuverhandlung tanzt wieder) und Importer-Cache-Epoche
+            // wechseln (Neuverhandlung = neue Buffer). Ein Bump vor dem Parse
+            // ließe bei Parse-Fehlern alte Maße mit neuer Epoche laufen.
+            ud.announced = None;
+            ud.epoch += 1;
             ud.width = info.size().width;
             ud.height = info.size().height;
             ud.modifier = modifier as u64;
@@ -554,8 +681,9 @@ fn run_pipewire(
                 });
             }
             if !planes.is_empty() {
-                // Voll oder Receiver weg → Frame droppt, Plane-fds schließen sich.
-                let _ = ud.frame_tx.try_send(DmabufFrame {
+                // Mailbox: ersetzt einen ggf. liegenden älteren Frame (droppt
+                // samt fds) — der Consumer bekommt immer den neuesten Stand.
+                ud.frame_tx.put(DmabufFrame {
                     planes,
                     width: ud.width,
                     height: ud.height,
@@ -587,6 +715,73 @@ fn run_pipewire(
     mainloop.run();
     tracing::debug!(target: "pipewire", "Mainloop beendet (stop)");
     Ok(())
+}
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+
+    fn frame(pts: u64) -> DmabufFrame {
+        DmabufFrame {
+            planes: Vec::new(),
+            width: 1,
+            height: 1,
+            drm_fourcc: 0,
+            modifier: 0,
+            pts,
+            buffer_key: 1,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn latest_wins_and_empty_is_none() {
+        let mb = FrameMailbox::new();
+        assert!(mb.take().unwrap().is_none());
+        mb.put(frame(1));
+        mb.put(frame(2));
+        assert_eq!(mb.take().unwrap().unwrap().pts, 2, "immer der NEUESTE Frame");
+        assert!(mb.take().unwrap().is_none());
+    }
+
+    #[test]
+    fn closed_and_empty_reports_source_gone() {
+        let mb = FrameMailbox::new();
+        mb.close();
+        assert!(mb.take().is_err(), "geschlossen + leer = Quelle weg = Fehler");
+    }
+
+    #[test]
+    fn queued_frame_is_delivered_before_gone() {
+        let mb = FrameMailbox::new();
+        mb.put(frame(7));
+        mb.close();
+        assert_eq!(mb.take().unwrap().unwrap().pts, 7);
+        assert!(mb.take().is_err());
+    }
+
+    #[test]
+    fn sender_drop_closes() {
+        let mb = FrameMailbox::new();
+        let tx = FrameSender(mb.clone());
+        drop(tx);
+        assert!(mb.take().is_err());
+    }
+
+    #[test]
+    fn wait_take_wakes_on_put() {
+        let mb = FrameMailbox::new();
+        let mb2 = mb.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            mb2.put(frame(3));
+        });
+        let start = std::time::Instant::now();
+        let got = mb.wait_take(Duration::from_secs(2)).unwrap();
+        assert_eq!(got.unwrap().pts, 3);
+        assert!(start.elapsed() < Duration::from_secs(1), "muss auf put aufwachen, nicht voll warten");
+        t.join().unwrap();
+    }
 }
 
 #[cfg(test)]

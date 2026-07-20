@@ -42,6 +42,10 @@ pub struct VaapiImporter {
     width: u32,
     height: u32,
     drm_fourcc: u32,
+    /// Für den Graph-Neubau bei Auflösungswechsel (Fenster-Resize).
+    fps: u32,
+    out_w: u32,
+    out_h: u32,
 }
 
 impl VaapiImporter {
@@ -84,6 +88,9 @@ impl VaapiImporter {
                 width,
                 height,
                 drm_fourcc,
+                fps,
+                out_w,
+                out_h,
             };
             if let Err(e) = me.build_graph(fps, out_w, out_h) {
                 // me's Drop räumt drm_dev/graph auf.
@@ -230,11 +237,49 @@ impl VaapiImporter {
         self.out_frames
     }
 
+    /// Graph + DRM-Frames-Ctx für neue Eingabemaße neu bauen (Ausgabe fix).
+    /// Der Encoder hält seine EIGENE Ref auf den alten out_frames-Ctx — der
+    /// alte Graph darf weg.
+    unsafe fn rebuild_for(&mut self, w: u32, h: u32) -> Result<()> {
+        unsafe {
+            if !self.graph.is_null() {
+                avfilter_graph_free(&mut self.graph);
+            }
+            self.src_ctx = ptr::null_mut();
+            self.sink_ctx = ptr::null_mut();
+            self.out_frames = ptr::null_mut();
+            if !self.drm_frames.is_null() {
+                av_buffer_unref(&mut self.drm_frames);
+            }
+            self.width = w;
+            self.height = h;
+            self.build_graph(self.fps, self.out_w, self.out_h)
+        }
+    }
+
     /// Importiere einen DMABUF-Frame → NV12-VAAPI-`AVFrame`. Die fds bleiben
     /// beim Caller. Caller besitzt das Ergebnis (`av_frame_free`).
     pub fn import(&mut self, frame: &DmabufFrame) -> Result<*mut AVFrame> {
         if frame.planes.is_empty() || frame.planes.len() > 4 {
             return Err(anyhow!("DmabufFrame mit {} Planes", frame.planes.len()));
+        }
+        // Fenster-Resize: die Capture liefert neue Maße, der Graph (und der
+        // DRM-Frames-Ctx samt objects[].size-Rechnung) ist auf die alten
+        // fixiert — jeder Import scheiterte bzw. läse out-of-bounds, und der
+        // Pacing-Loop duplizierte das letzte Bild für IMMER (Standbild bei
+        // „Live"). Graph mit den neuen Eingabemaßen neu bauen; die AUSGABE
+        // bleibt fix (der Encoder kann mid-stream nicht umkonfigurieren),
+        // scale_vaapi skaliert die neue Geometrie hinein. hwmap derived die
+        // VAAPI-Device aus DEMSELBEN drm_dev → gecachte Ableitung, gleiche
+        // VADisplay, die Surfaces bleiben encoder-kompatibel.
+        if frame.width != self.width || frame.height != self.height {
+            tracing::info!(
+                target: "stream",
+                from = format!("{}x{}", self.width, self.height),
+                to = format!("{}x{}", frame.width, frame.height),
+                "Capture-Auflösung geändert — VAAPI-Graph wird neu gebaut"
+            );
+            unsafe { self.rebuild_for(frame.width, frame.height)? };
         }
         unsafe {
             // DRM-Deskriptor: ein Objekt pro Plane-fd (PipeWire dup't pro Plane),

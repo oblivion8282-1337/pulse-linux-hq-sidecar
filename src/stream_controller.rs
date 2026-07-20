@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 use ffmpeg_next as ffmpeg;
 
 use crate::capture::audio::{self, AudioCapture, AudioSelection};
-use crate::capture::pipewire_stream::{DmabufFrame, PipewireCapture};
+use crate::capture::pipewire_stream::{DmabufFrame, FrameMailbox, PipewireCapture};
 use crate::capture::portal;
 use crate::encode::audio::AudioEncoder;
 use crate::encode::mux_writer::MuxSender;
@@ -81,22 +81,22 @@ impl AudioPipeline {
         av_offset_ms: i32,
         selection: &AudioSelection,
     ) -> Result<Self> {
-        let (rx, cap) = AudioCapture::start(selection)?;
+        let (rx, cap) = AudioCapture::start(selection, record_start)?;
         let worker = thread::Builder::new()
             .name("hq-audio-encode".into())
             .spawn(move || {
-                // Jeder Sample-Batch trägt seine Wanduhr-Position relativ zu
-                // record_start (in Samples) als Anker: der erste verankert die
-                // Audio-Zeitlinie (Audio beginnt bei genau der Video-Zeit, zu
-                // der es wirklich einsetzt — kein fixer Offset; GSR schaltet
-                // den bei Livestream auch ab: force_no_audio_offset), spätere
-                // lassen `PtsTimeline` Capture-Lücken erkennen und re-ankern.
+                // Jeder Sample-Batch trägt seine CAPTURE-Zeit relativ zu
+                // record_start (in Samples, im PW-Callback gestempelt) als
+                // Anker: der erste verankert die Audio-Zeitlinie (Audio
+                // beginnt bei genau der Video-Zeit, zu der es wirklich
+                // einsetzt — kein fixer Offset; GSR: force_no_audio_offset),
+                // spätere lassen `PtsTimeline` echte Capture-Lücken erkennen.
+                // Empfangszeit wäre falsch: ein Consumer-Stau sähe wie eine
+                // Lücke aus und versetzte den Ton permanent.
                 let offset_samples =
                     av_offset_ms as i64 * audio::SAMPLE_RATE as i64 / 1000;
-                while let Ok(samples) = rx.recv() {
-                    let elapsed = record_start.elapsed().as_secs_f64();
-                    let anchor =
-                        (elapsed * audio::SAMPLE_RATE as f64) as i64 + offset_samples;
+                while let Ok((samples, capture_anchor)) = rx.recv() {
+                    let anchor = capture_anchor + offset_samples;
                     if let Err(e) = enc.push(&samples, &mux, anchor) {
                         emit(Event::Log { line: format!("[audio] push: {e:#}") });
                         break;
@@ -288,13 +288,14 @@ impl Drop for WorkerDoneGuard {
         self.0.running.store(false, Ordering::SeqCst);
         self.0.live.store(false, Ordering::SeqCst);
         if thread::panicking() {
-            // `emit` ist panic-sicher (no-op ohne Init, kein Lock-Panic) —
-            // der Parent bekommt so auch bei einem Absturz error + stopped.
+            // `emit` ist panic-sicher (no-op ohne Init, kein Lock-Panic).
+            // Gleiche Eventfolge wie der reguläre Fehlerpfad: error +
+            // state:error als TERMINALZUSTAND (kein stopped — control.py-
+            // Parität, die UI soll den Fehler zeigen).
             emit(Event::Error {
                 message: "Stream-Worker abgestürzt (Panic) — Details in sidecar.log".to_string(),
             });
-            emit(Event::State { state: StreamState::Error, running: false, uptime_s: 0.0 });
-            emit(Event::Stopped { code: None });
+            emit(Event::State { state: StreamState::Error, running: false, uptime_s: 0 });
         }
     }
 }
@@ -304,11 +305,10 @@ impl Drop for WorkerDoneGuard {
 /// 10 s, ohne den Stop zu sehen: `stop()` joint den Worker, d. h. die gesamte
 /// RPC-Schleife (und der Shutdown bei stdin-EOF) hing solange fest.
 fn wait_first_frame(
-    rx: &Receiver<DmabufFrame>,
+    frames: &FrameMailbox,
     stop_rx: &Receiver<()>,
     timeout: Duration,
 ) -> Result<Option<DmabufFrame>> {
-    use std::sync::mpsc::RecvTimeoutError;
     let deadline = Instant::now() + timeout;
     loop {
         match stop_rx.try_recv() {
@@ -318,46 +318,17 @@ fn wait_first_frame(
         let slice = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(100));
-        match rx.recv_timeout(slice) {
-            Ok(f) => return Ok(Some(f)),
-            Err(RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow!("kein Bild vom Compositor in 10s (ist die Quelle sichtbar?)"));
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!("Capture-Thread beendet, bevor ein Frame kam"));
-            }
+        // Err aus wait_take = Capture-Thread schon wieder weg → propagieren.
+        if let Some(f) = frames.wait_take(slice)? {
+            return Ok(Some(f));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "kein Bild vom Compositor in {}s (ist die Quelle sichtbar?)",
+                timeout.as_secs()
+            ));
         }
     }
-}
-
-/// Alle seit dem letzten Tick eingetroffenen Frames abholen, nur den neuesten
-/// behalten (Damage kann mehrere geliefert haben; ältere wären veraltet und
-/// schließen ihre fds beim Drop). `Err` = die Capture-Quelle ist WEG (Kanal
-/// disconnected, Capture-Thread beendet — z. B. gestreamtes Fenster
-/// geschlossen): der Stream muss enden, statt das letzte Bild ewig zu
-/// duplizieren (Zuschauer sähen ein Standbild, der Streamer weiter „Live").
-fn drain_newest(rx: &Receiver<DmabufFrame>) -> Result<Option<DmabufFrame>> {
-    let mut newest: Option<DmabufFrame> = None;
-    loop {
-        match rx.try_recv() {
-            Ok(f) => newest = Some(f),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                // Bereits gequeue'te Frames sind real und aktueller als das
-                // letzte encodierte Bild — erst ausliefern, der NÄCHSTE Drain
-                // meldet dann das Ende.
-                if newest.is_some() {
-                    break;
-                }
-                return Err(anyhow!(
-                    "Capture-Quelle beendet (gestreamtes Fenster geschlossen?)"
-                ));
-            }
-        }
-    }
-    Ok(newest)
 }
 
 /// Räumt einen bereits beendeten (aber nie per `stop` abgeholten) Stream ab.
@@ -410,20 +381,30 @@ impl StreamController {
                 let result = run_stream(params, stop_rx, &shared_worker);
                 shared_worker.running.store(false, Ordering::SeqCst);
                 shared_worker.live.store(false, Ordering::SeqCst);
-                if let Err(e) = result {
-                    emit(Event::Error { message: format!("{e:#}") });
-                    emit(Event::State {
-                        state: StreamState::Error,
-                        running: false,
-                        uptime_s: 0.0,
-                    });
+                match result {
+                    // Parität zu control.py: nach einem Fehler bleibt der
+                    // Terminalzustand `error` — KEIN `stopped` hinterher
+                    // (das flippte die UI auf neutrales „Beendet" statt des
+                    // roten Fehler-Labels).
+                    Err(e) => {
+                        emit(Event::Error { message: format!("{e:#}") });
+                        emit(Event::State {
+                            state: StreamState::Error,
+                            running: false,
+                            uptime_s: 0,
+                        });
+                    }
+                    // Sauberes Ende (User-Stop, Quelle beendet, Portal-Abbruch
+                    // = code 60 — wie GSRs Exit-Code, kein Fehler).
+                    Ok(code) => {
+                        emit(Event::State {
+                            state: StreamState::Stopped,
+                            running: false,
+                            uptime_s: 0,
+                        });
+                        emit(Event::Stopped { code });
+                    }
                 }
-                emit(Event::State {
-                    state: StreamState::Stopped,
-                    running: false,
-                    uptime_s: 0.0,
-                });
-                emit(Event::Stopped { code: None });
             })
             .map_err(|e| anyhow!("spawn hq-stream thread: {e}"))?;
 
@@ -480,12 +461,16 @@ impl StreamController {
 /// Worker body: Portal→PipeWire-DMABUF→Zero-Copy-Import→HW-Encode→RTMPS-Push
 /// bis stop. Konstante Bildrate durch Frame-Duplikation (Compositor liefert
 /// nur bei Damage; ein Live-Stream braucht CFR).
-fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Result<()> {
+///
+/// `Ok(code)` = sauberes Ende; `Some(60)` = Portal-Abbruch durch den User
+/// (GSR-Exit-Code-Konvention, KEIN Fehler — control.py-Parität: der Dialog-
+/// Wegklick erzeugt keinen roten Fehler, nur `stopped {"code":60}`).
+fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Result<Option<i32>> {
     *shared.started_at.lock().unwrap() = Some(Instant::now());
     emit(Event::State {
         state: StreamState::Starting,
         running: true,
-        uptime_s: 0.0,
+        uptime_s: 0,
     });
 
     // detect() liefert die Default-GPU (dGPU-bevorzugt bzw. PULSE_HQ_VENDOR).
@@ -502,9 +487,12 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     let session = match portal::open(params.show_cursor, &shared.stop_requested) {
         Ok(s) => s,
         // stop während des Dialogs = kein Fehler — sauber beenden.
-        Err(_) if shared.stop_requested.load(Ordering::SeqCst) => return Ok(()),
+        Err(_) if shared.stop_requested.load(Ordering::SeqCst) => return Ok(None),
         Err(e) if portal::is_portal_canceled(&e) => {
-            return Err(anyhow!("Quellenauswahl abgebrochen"));
+            emit(Event::Log {
+                line: "[stream] Quellenauswahl abgebrochen".to_string(),
+            });
+            return Ok(Some(portal::EXIT_PORTAL_CANCELED));
         }
         Err(e) => return Err(anyhow!("Portal-Verhandlung: {e:#}")),
     };
@@ -516,7 +504,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     });
 
     // 2) PipeWire-Capture auf fd + node_id starten.
-    let (rx, mut cap) = PipewireCapture::start(
+    let (frames, mut cap) = PipewireCapture::start(
         session.pw_fd,
         session.node_id,
         session.width,
@@ -526,8 +514,8 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     // 3) Auf den ersten DMABUF-Frame warten → verbindliche (negotiierte) Maße.
     //    Stop-abbrechbar: `stop()` joint den Worker — bliebe das Warten blind
     //    für den Stop, hinge die ganze RPC-Schleife bis zu 10 s fest.
-    let Some(first) = wait_first_frame(&rx, &stop_rx, Duration::from_secs(10))? else {
-        return Ok(()); // stop während der Startphase → sauber beenden
+    let Some(first) = wait_first_frame(&frames, &stop_rx, Duration::from_secs(10))? else {
+        return Ok(None); // stop während der Startphase → sauber beenden
     };
     let (width, height) = (first.width, first.height);
 
@@ -722,11 +710,15 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         None => None,
     };
 
+    // Uptime-Nullpunkt = record_start (NICHT der Worker-Start vor dem
+    // Portal-Dialog) — sonst meldet `state` Minuten mehr Uptime als die
+    // fps-Events, wenn der Dialog lange offen stand.
+    *shared.started_at.lock().unwrap() = Some(record_start);
     shared.live.store(true, Ordering::SeqCst);
     emit(Event::State {
         state: StreamState::Live,
         running: true,
-        uptime_s: 0.0,
+        uptime_s: 0,
     });
 
     let frame_interval = Duration::from_secs_f64(1.0 / params.fps.max(1) as f64);
@@ -747,7 +739,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             // Neuesten Frame abholen; Err = Capture-Quelle weg (Fenster
             // geschlossen) → Stream sauber beenden statt das letzte Bild ewig
             // zu duplizieren (error-Event → Live-Badge verschwindet).
-            if let Some(frame) = drain_newest(&rx)? {
+            if let Some(frame) = frames.take()? {
                 match importer.import(&frame) {
                     Ok(hw) => {
                         unsafe { ffmpeg::ffi::av_frame_free(&mut last_hw) };
@@ -777,7 +769,10 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             if window_start.elapsed() >= Duration::from_secs(1) {
                 let fps = window_frames as f64 / window_start.elapsed().as_secs_f64();
                 shared.fps_milli.store((fps * 1000.0) as u64, Ordering::SeqCst);
-                emit(Event::Fps { fps, uptime_s: record_start.elapsed().as_secs_f64() });
+                emit(Event::Fps {
+                    fps: fps.round().max(0.0) as u64,
+                    uptime_s: record_start.elapsed().as_secs(),
+                });
                 window_start = Instant::now();
                 window_frames = 0;
             }
@@ -806,7 +801,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         }
     }
     let finish_result = enc.finish();
-    run_result.and(finish_result)
+    run_result.and(finish_result).map(|_| None)
 }
 
 /// Import-Kandidaten in Hersteller-Reihenfolge zu konkreten Render-Nodes
@@ -864,11 +859,11 @@ mod lifecycle_tests {
     /// (Ok(None)), nicht erst nach dem vollen Timeout.
     #[test]
     fn wait_first_frame_aborts_on_stop() {
-        let (_frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(1);
+        let frames = FrameMailbox::new();
         let (stop_tx, stop_rx) = channel::<()>();
         stop_tx.send(()).unwrap();
         let t0 = Instant::now();
-        let r = wait_first_frame(&frame_rx, &stop_rx, Duration::from_secs(10)).unwrap();
+        let r = wait_first_frame(&frames, &stop_rx, Duration::from_secs(10)).unwrap();
         assert!(r.is_none(), "Stop muss Ok(None) liefern");
         assert!(
             t0.elapsed() < Duration::from_secs(2),
@@ -878,54 +873,9 @@ mod lifecycle_tests {
 
     #[test]
     fn wait_first_frame_times_out_without_frame() {
-        let (_frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(1);
+        let frames = FrameMailbox::new();
         let (_stop_tx, stop_rx) = channel::<()>();
-        assert!(wait_first_frame(&frame_rx, &stop_rx, Duration::from_millis(200)).is_err());
-    }
-
-    fn test_frame(pts: u64) -> DmabufFrame {
-        DmabufFrame {
-            planes: Vec::new(),
-            width: 1,
-            height: 1,
-            drm_fourcc: 0,
-            modifier: 0,
-            pts,
-            buffer_key: 1,
-            epoch: 0,
-        }
-    }
-
-    /// Kanal leer, Sender lebt = normaler Tick ohne neuen Frame (Ok(None));
-    /// mehrere gequeue'te Frames = nur der neueste kommt zurück.
-    #[test]
-    fn drain_newest_returns_latest_frame() {
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(8);
-        assert!(drain_newest(&frame_rx).unwrap().is_none());
-        frame_tx.send(test_frame(1)).unwrap();
-        frame_tx.send(test_frame(2)).unwrap();
-        assert_eq!(drain_newest(&frame_rx).unwrap().unwrap().pts, 2);
-    }
-
-    /// Capture-Quelle weg (Fenster geschlossen → Capture-Thread endet →
-    /// Sender gedroppt): muss ein Fehler sein, KEIN „kein neuer Frame" —
-    /// sonst dupliziert der Pacing-Loop das letzte Bild für immer.
-    #[test]
-    fn drain_newest_errors_when_source_is_gone() {
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(8);
-        drop(frame_tx);
-        assert!(drain_newest(&frame_rx).is_err(), "Disconnected muss den Stream beenden");
-    }
-
-    /// Noch gequeue'te Frames werden auch bei toter Quelle erst ausgeliefert
-    /// (sie sind real und aktueller als das letzte encodierte Bild).
-    #[test]
-    fn drain_newest_delivers_queued_frames_before_reporting_gone() {
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(8);
-        frame_tx.send(test_frame(7)).unwrap();
-        drop(frame_tx);
-        assert_eq!(drain_newest(&frame_rx).unwrap().unwrap().pts, 7);
-        assert!(drain_newest(&frame_rx).is_err());
+        assert!(wait_first_frame(&frames, &stop_rx, Duration::from_millis(200)).is_err());
     }
 }
 

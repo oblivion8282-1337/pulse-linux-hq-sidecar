@@ -81,13 +81,24 @@ struct SessionCloseGuard(#[allow(dead_code)] oneshot::Sender<()>);
 /// [`PortalCanceled`] gemeldet (Caller unterscheidet über sein Stop-Flag).
 pub fn open(show_cursor: bool, cancel: &AtomicBool) -> Result<PortalSession> {
     portal_runtime().block_on(async move {
-        let sc: Screencast<'static> = Screencast::new()
-            .await
-            .map_err(|e| anyhow!("Screencast::new: {e}"))?;
-        let session = sc
-            .create_session()
-            .await
-            .map_err(|e| anyhow!("create_session: {e}"))?;
+        // Auch Proxy-Aufbau + create_session ins select: ein HÄNGENDES (nicht
+        // totes) xdg-desktop-portal blockt sonst genau hier ohne je das
+        // Cancel-Flag zu sehen — zbus-Calls haben kein Default-Timeout.
+        // (Abbruch mitten in create_session kann serverseitig eine Session
+        // hinterlassen, die wir nie erfahren — seltener Preis, den Hänger der
+        // ganzen RPC-Schleife ist teurer.)
+        let sc: Screencast<'static> = tokio::select! {
+            r = Screencast::new() => r.map_err(|e| anyhow!("Screencast::new: {e}"))?,
+            _ = wait_cancel(cancel) => {
+                return Err(anyhow!(PortalCanceled).context("Portal-Aufbau abgebrochen (stop)"));
+            }
+        };
+        let session = tokio::select! {
+            r = sc.create_session() => r.map_err(|e| anyhow!("create_session: {e}"))?,
+            _ = wait_cancel(cancel) => {
+                return Err(anyhow!(PortalCanceled).context("Portal-Aufbau abgebrochen (stop)"));
+            }
+        };
 
         let negotiated = tokio::select! {
             r = negotiate(&sc, &session, show_cursor) => r,
@@ -104,8 +115,14 @@ pub fn open(show_cursor: bool, cancel: &AtomicBool) -> Result<PortalSession> {
                 let (close_tx, close_rx) = oneshot::channel::<()>();
                 tokio::spawn(async move {
                     let _ = close_rx.await;
-                    if let Err(e) = session.close().await {
-                        tracing::debug!(target: "stream", "portal session close: {e}");
+                    match tokio::time::timeout(Duration::from_secs(5), session.close()).await {
+                        Ok(Err(e)) => {
+                            tracing::debug!(target: "stream", "portal session close: {e}");
+                        }
+                        Err(_) => {
+                            tracing::debug!(target: "stream", "portal session close: Timeout");
+                        }
+                        Ok(Ok(())) => {}
                     }
                     drop(sc);
                 });
@@ -121,7 +138,10 @@ pub fn open(show_cursor: bool, cancel: &AtomicBool) -> Result<PortalSession> {
             Err(e) => {
                 // Fehlgeschlagene/abgebrochene Verhandlung: Session sofort
                 // schließen, sonst bleibt sie als Leiche im Compositor.
-                let _ = session.close().await;
+                // Mit Timeout: dieser Pfad läuft auch beim Cancel gegen ein
+                // ggf. HÄNGENDES Portal — `stop()` darf hier nicht ewig
+                // festhängen.
+                let _ = tokio::time::timeout(Duration::from_secs(5), session.close()).await;
                 Err(e)
             }
         }

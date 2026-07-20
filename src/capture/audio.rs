@@ -17,6 +17,7 @@
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use pipewire as pw;
 use pw::properties::properties;
@@ -100,9 +101,18 @@ impl AudioSelection {
     }
 }
 
+/// Sample-Batch + Capture-Zeit-Anker (Samples seit `record_start`, im
+/// PipeWire-Callback gestempelt). Der Anker MUSS capture-seitig entstehen:
+/// beim Empfang im Encode-Thread gestempelt würde ein Consumer-Stau (voller
+/// Mux, RTMPS-Backpressure) wie eine Capture-Lücke aussehen und die
+/// Re-Anker-Logik den Ton permanent nach hinten versetzen.
+pub type AudioBatch = (Vec<f32>, i64);
+
 struct AudioData {
-    sample_tx: Sender<Vec<f32>>,
+    sample_tx: Sender<AudioBatch>,
     info: AudioInfoRaw,
+    record_start: Instant,
+    format_warned: bool,
 }
 
 /// Laufende Audio-Capture-Session. `stop` beendet den Worker-Thread.
@@ -113,19 +123,24 @@ pub struct AudioCapture {
 
 impl AudioCapture {
     /// Starte die Capture für den gegebenen Modus. Liefert interleaved
-    /// F32-Stereo-Chunks (Länge variabel, ein Chunk pro PipeWire-`process`).
-    pub fn start(selection: &AudioSelection) -> anyhow::Result<(Receiver<Vec<f32>>, Self)> {
+    /// F32-Stereo-Chunks mit Capture-Zeit-Anker (ein Batch pro
+    /// PipeWire-`process`). `record_start` = gemeinsamer Monotonic-Nullpunkt
+    /// mit dem Video-Pfad.
+    pub fn start(
+        selection: &AudioSelection,
+        record_start: Instant,
+    ) -> anyhow::Result<(Receiver<AudioBatch>, Self)> {
         if !selection.enabled() {
             anyhow::bail!("AudioCapture::start mit AudioSelection::Off");
         }
         let selection = selection.clone();
-        let (sample_tx, sample_rx) = channel::<Vec<f32>>();
+        let (sample_tx, sample_rx) = channel::<AudioBatch>();
         let (stop_tx, stop_rx) = pw::channel::channel::<()>();
 
         let worker = thread::Builder::new()
             .name("pipewire-audio".into())
             .spawn(move || {
-                if let Err(e) = run_audio(selection, sample_tx, stop_rx) {
+                if let Err(e) = run_audio(selection, sample_tx, record_start, stop_rx) {
                     tracing::error!(target: "audio", "Audio-Capture-Thread: {e:#}");
                 }
             })?;
@@ -140,9 +155,19 @@ impl AudioCapture {
     }
 }
 
+/// Wie bei `PipewireCapture`: ohne Drop liefe der Audio-Worker (samt Router-
+/// Sink + Links im User-Graph) ewig weiter, wenn ein Fehlerpfad das explizite
+/// `stop()` überspringt.
+impl Drop for AudioCapture {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn run_audio(
     selection: AudioSelection,
-    sample_tx: Sender<Vec<f32>>,
+    sample_tx: Sender<AudioBatch>,
+    record_start: Instant,
     stop_rx: pw::channel::Receiver<()>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -154,6 +179,26 @@ fn run_audio(
     });
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
+
+    // Core-Error (PipeWire-Daemon stirbt/Restart): Mainloop beenden statt mit
+    // toter Verbindung stumm weiterzulaufen — der Sample-Kanal schließt, der
+    // Encode-Thread flusht und endet, der Stream läuft ohne Audio weiter und
+    // das Log sagt warum. (Der Video-Pfad erkennt sein Ende separat über
+    // `state_changed`.)
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let mainloop = mainloop.clone();
+            move |id, seq, res, message| {
+                tracing::error!(
+                    target: "audio",
+                    id, seq, res, message,
+                    "PipeWire-Core-Fehler — Audio-Capture endet"
+                );
+                mainloop.quit();
+            }
+        })
+        .register();
 
     // Modusabhängig: Desktop/App bekommen einen Router (eigener Capture-Sink,
     // auf den nur die gewünschten Quellen gelinkt werden) und der Stream hängt
@@ -190,7 +235,12 @@ fn run_audio(
     req.set_format(AudioFormat::F32LE);
     req.set_rate(SAMPLE_RATE);
     req.set_channels(CHANNELS);
-    let data = AudioData { sample_tx, info: AudioInfoRaw::new() };
+    let data = AudioData {
+        sample_tx,
+        info: AudioInfoRaw::new(),
+        record_start,
+        format_warned: false,
+    };
 
     let stream = pw::stream::StreamRc::new(core, "pulse-linux-hq-sidecar-audio", props)?;
 
@@ -217,6 +267,17 @@ fn run_audio(
                     channels = ud.info.channels(),
                     "Audio-Format ausgehandelt"
                 );
+                // Der Opus-Pfad nimmt F32/48k/2ch blind an — weicht das
+                // Negotiat je ab, gäbe es falsche Tonhöhe/Kanäle OHNE jede
+                // Diagnose. Laut warnen (Adapter konvertiert normal immer).
+                if ud.info.rate() != SAMPLE_RATE || ud.info.channels() != CHANNELS {
+                    tracing::error!(
+                        target: "audio",
+                        rate = ud.info.rate(),
+                        channels = ud.info.channels(),
+                        "Negotiat weicht von F32/48k/2ch ab — Ton wäre falsch!"
+                    );
+                }
             }
         })
         .process(|stream, ud| {
@@ -236,8 +297,16 @@ fn run_audio(
                 if samples.is_empty() {
                     return;
                 }
+                if ud.info.rate() != 0 && ud.info.rate() != SAMPLE_RATE && !ud.format_warned {
+                    ud.format_warned = true;
+                    tracing::error!(target: "audio", "liefere Samples mit falscher Rate — s. Negotiat-Warnung");
+                }
+                // Capture-Zeit-Anker: JETZT gestempelt (im PW-Callback), nicht
+                // beim Empfang — s. AudioBatch-Doku.
+                let anchor = (ud.record_start.elapsed().as_secs_f64()
+                    * SAMPLE_RATE as f64) as i64;
                 // Fehlt der Consumer, ist der Stream vorbei — Fehler ignorieren.
-                let _ = ud.sample_tx.send(samples);
+                let _ = ud.sample_tx.send((samples, anchor));
             }
         })
         .register()?;
