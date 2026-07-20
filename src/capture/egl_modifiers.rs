@@ -165,7 +165,16 @@ fn query_into(fourccs: &[u32], out: &mut HashMap<u32, Vec<u64>>) -> Result<(), S
                     {
                         mods.truncate(written.max(0) as usize);
                         let entry = out.entry(fourcc).or_default();
-                        for m in mods {
+                        for (i, m) in mods.into_iter().enumerate() {
+                            // external_only-Modifier NICHT anbieten: die lassen
+                            // sich nur an GL_TEXTURE_EXTERNAL_OES binden, der
+                            // NVENC-Importer bindet GL_TEXTURE_2D — wählte der
+                            // Compositor so einen, scheiterte jeder Import.
+                            // (Gleiche Regel wie der DCC-Filter: nichts
+                            // anbieten, was wir nicht konsumieren können.)
+                            if external.get(i).copied().unwrap_or(0) != 0 {
+                                continue;
+                            }
                             if !entry.contains(&m) {
                                 entry.push(m);
                             }

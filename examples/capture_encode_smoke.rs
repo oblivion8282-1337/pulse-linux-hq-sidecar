@@ -55,7 +55,8 @@ fn main() -> anyhow::Result<()> {
 
     // Erster Frame bestimmt die realen (negotiierten) Maße.
     let first = rx
-        .recv_timeout(Duration::from_secs(15))
+        .wait_take(Duration::from_secs(15))
+        .and_then(|o| o.ok_or_else(|| anyhow::anyhow!("kein Frame in 15s")))
         .map_err(|_| anyhow::anyhow!("kein DMABUF-Frame in 15s (Dialog? Damage? — Fenster bewegen)"))?;
     let (w, h) = (first.width, first.height);
     eprintln!(
@@ -102,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         if sent >= n_frames {
             break;
         }
-        frame = match rx.recv_timeout(Duration::from_secs(5)) {
+        frame = match rx.wait_take(Duration::from_secs(5)).and_then(|o| o.ok_or_else(|| anyhow::anyhow!("Timeout"))) {
             Ok(f) => f,
             Err(_) => {
                 eprintln!("[capture_encode] 5s ohne Frame (kein Damage?) — beende mit {sent} Frames");

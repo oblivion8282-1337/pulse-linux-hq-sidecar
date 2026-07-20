@@ -56,11 +56,18 @@ impl Response {
 #[serde(tag = "ev", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum Event {
-    State { state: StreamState, running: bool, uptime_s: f64 },
-    Fps { fps: f64, uptime_s: f64 },
+    /// `uptime_s`/`fps` als Ints — Parität zu control.py (der Renderer rendert
+    /// die Werte direkt; Floats ergäben „59.94000000004 fps" in der UI).
+    State { state: StreamState, running: bool, uptime_s: u64 },
+    Fps { fps: u64, uptime_s: u64 },
     Log { line: String },
     Error { message: String },
-    Stopped { code: Option<i32> },
+    /// `code` bei None weggelassen (nicht null) — wie control.py; Some(60) =
+    /// Portal-Abbruch durch den User.
+    Stopped {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -72,4 +79,42 @@ pub enum StreamState {
     Live,
     Error,
     Stopped,
+}
+
+#[cfg(test)]
+mod event_shape_tests {
+    use super::*;
+
+    /// Parität zu control.py: `fps`/`uptime_s` sind Ints auf der Leitung —
+    /// der Renderer rendert die Werte direkt („59.94000000004 fps" sonst).
+    #[test]
+    fn fps_event_uses_integers() {
+        let v = serde_json::to_value(Event::Fps { fps: 59, uptime_s: 12 }).unwrap();
+        assert!(v["fps"].is_u64(), "fps muss int sein: {v}");
+        assert!(v["uptime_s"].is_u64(), "uptime_s muss int sein: {v}");
+    }
+
+    #[test]
+    fn state_event_uses_integer_uptime() {
+        let v = serde_json::to_value(Event::State {
+            state: StreamState::Live,
+            running: true,
+            uptime_s: 3,
+        })
+        .unwrap();
+        assert!(v["uptime_s"].is_u64(), "uptime_s muss int sein: {v}");
+    }
+
+    /// Parität zu control.py: `code` wird bei None WEGGELASSEN (nicht null),
+    /// bei Some mitgeschickt (Exit 60 = Portal-Abbruch).
+    #[test]
+    fn stopped_code_is_omitted_when_none() {
+        let v = serde_json::to_value(Event::Stopped { code: None }).unwrap();
+        assert!(
+            v.as_object().unwrap().get("code").is_none(),
+            "code:null darf nicht serialisiert werden: {v}"
+        );
+        let v = serde_json::to_value(Event::Stopped { code: Some(60) }).unwrap();
+        assert_eq!(v["code"], serde_json::json!(60));
+    }
 }

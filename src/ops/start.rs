@@ -80,11 +80,11 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
         .and_then(Value::as_u64)
         .unwrap_or(profile.fps as u64)
         .clamp(1, 1000) as u32;
-    let bitrate_kbps = clamp_bitrate(
+    let bitrate_kbps = effective_bitrate(
         overrides
             .and_then(|o| o.get("bitrate_kbps"))
-            .and_then(Value::as_u64)
-            .unwrap_or(profile.bitrate_kbps as u64),
+            .and_then(Value::as_u64),
+        profile.bitrate_kbps,
     );
     let av_offset_ms = params
         .get("av_offset_ms")
@@ -163,23 +163,32 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
 /// 2^32 → 0 kbps) — ein kaputt konfigurierter/veralteter Client bekäme einen
 /// unbrauchbaren Stream statt eines klaren Werts. 1 Gbit/s deckt jedes reale
 /// Profil (Profile liegen bei 4000).
-fn clamp_bitrate(kbps: u64) -> u32 {
-    kbps.clamp(1, 1_000_000) as u32
+fn effective_bitrate(requested: Option<u64>, profile_default: u32) -> u32 {
+    requested
+        .filter(|&v| v > 0)
+        .unwrap_or(profile_default as u64)
+        .clamp(1, 1_000_000) as u32
 }
 
 #[cfg(test)]
 mod bitrate_tests {
-    use super::clamp_bitrate;
+    use super::effective_bitrate;
 
     #[test]
     fn clamps_instead_of_truncating() {
-        assert_eq!(clamp_bitrate(4000), 4000);
+        assert_eq!(effective_bitrate(Some(4000), 8000), 4000);
         // Kein Modulo-Wrap: 2^32 darf nicht zu 0, 2^32+500 nicht zu 500 werden.
-        assert_eq!(clamp_bitrate(1 << 32), 1_000_000);
-        assert_eq!(clamp_bitrate((1 << 32) + 500), 1_000_000);
-        assert_eq!(clamp_bitrate(u64::MAX), 1_000_000);
-        // 0 ist kein sinnvoller Encoder-Wert.
-        assert_eq!(clamp_bitrate(0), 1);
+        assert_eq!(effective_bitrate(Some(1 << 32), 8000), 1_000_000);
+        assert_eq!(effective_bitrate(Some((1 << 32) + 500), 8000), 1_000_000);
+        assert_eq!(effective_bitrate(Some(u64::MAX), 8000), 1_000_000);
+    }
+
+    #[test]
+    fn zero_and_missing_fall_back_to_profile() {
+        // Explizite 0 hieß nie „1 kbps" — sie fällt aufs Profil zurück
+        // (beim Python-Sidecar war 0 „Encoder-Default").
+        assert_eq!(effective_bitrate(Some(0), 4000), 4000);
+        assert_eq!(effective_bitrate(None, 4000), 4000);
     }
 }
 

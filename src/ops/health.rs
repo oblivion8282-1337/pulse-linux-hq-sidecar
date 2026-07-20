@@ -46,10 +46,14 @@ pub fn handle(_params: Map<String, Value>) -> Result<Map<String, Value>> {
         "display_server": detect_display_server(),
         // Codecs (Phase 4: echte Open-Probe pro Vendor; aktuell statisch h264+av1).
         "video_codecs": caps::available_video_codecs(),
-        // PipeWire/Portal kann Display, Window oder Region capturen.
-        "capture_options": ["display", "window", "region"],
-        // entfällt (ffmpeg-as-lib muxed Opus→FLV ohne GSR-Patch).
-        "has_flv_patch": Value::Null,
+        // Das Portal verhandelt Monitor ODER Window (`SourceType` in
+        // portal.rs) — "region" hier zu bewerben hieße, einen Modus zu
+        // versprechen, der still als Monitor/Window-Dialog endet.
+        "capture_options": ["display", "window"],
+        // true: ffmpeg-as-lib (FFmpeg 8) muxed Opus→FLV nativ — die
+        // Fähigkeit, um die es beim GSR-Patch ging, ist vorhanden. (Null
+        // verletzte den typisierten boolean-Kontrakt in gsr.ts.)
+        "has_flv_patch": true,
         // Echt aus avformat_configuration() — verrät, ob tls_verify=0 für
         // RTMPS mit self-signed MediaMTX-certs greift (gnutls/openssl: ja).
         "tls_backend": tls::detect(),
