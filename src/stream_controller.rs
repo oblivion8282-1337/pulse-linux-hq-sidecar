@@ -332,6 +332,34 @@ fn wait_first_frame(
     }
 }
 
+/// Alle seit dem letzten Tick eingetroffenen Frames abholen, nur den neuesten
+/// behalten (Damage kann mehrere geliefert haben; ältere wären veraltet und
+/// schließen ihre fds beim Drop). `Err` = die Capture-Quelle ist WEG (Kanal
+/// disconnected, Capture-Thread beendet — z. B. gestreamtes Fenster
+/// geschlossen): der Stream muss enden, statt das letzte Bild ewig zu
+/// duplizieren (Zuschauer sähen ein Standbild, der Streamer weiter „Live").
+fn drain_newest(rx: &Receiver<DmabufFrame>) -> Result<Option<DmabufFrame>> {
+    let mut newest: Option<DmabufFrame> = None;
+    loop {
+        match rx.try_recv() {
+            Ok(f) => newest = Some(f),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                // Bereits gequeue'te Frames sind real und aktueller als das
+                // letzte encodierte Bild — erst ausliefern, der NÄCHSTE Drain
+                // meldet dann das Ende.
+                if newest.is_some() {
+                    break;
+                }
+                return Err(anyhow!(
+                    "Capture-Quelle beendet (gestreamtes Fenster geschlossen?)"
+                ));
+            }
+        }
+    }
+    Ok(newest)
+}
+
 /// Räumt einen bereits beendeten (aber nie per `stop` abgeholten) Stream ab.
 ///
 /// Endet der Worker von selbst — Ingest-Fehler (`Connection refused`), EOF, GPU-
@@ -716,20 +744,10 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
                 Err(TryRecvError::Empty) => {}
             }
 
-            // Alle seit dem letzten Tick eingetroffenen Frames abholen, nur den
-            // neuesten behalten (Damage kann mehrere geliefert haben; ältere
-            // wären ohnehin veraltet). Verworfene Frames schließen ihre fds
-            // selbst (Plane-Drop).
-            let mut newest: Option<DmabufFrame> = None;
-            loop {
-                match rx.try_recv() {
-                    Ok(f) => {
-                        let _ = newest.replace(f);
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                }
-            }
-            if let Some(frame) = newest {
+            // Neuesten Frame abholen; Err = Capture-Quelle weg (Fenster
+            // geschlossen) → Stream sauber beenden statt das letzte Bild ewig
+            // zu duplizieren (error-Event → Live-Badge verschwindet).
+            if let Some(frame) = drain_newest(&rx)? {
                 match importer.import(&frame) {
                     Ok(hw) => {
                         unsafe { ffmpeg::ffi::av_frame_free(&mut last_hw) };
@@ -863,6 +881,51 @@ mod lifecycle_tests {
         let (_frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(1);
         let (_stop_tx, stop_rx) = channel::<()>();
         assert!(wait_first_frame(&frame_rx, &stop_rx, Duration::from_millis(200)).is_err());
+    }
+
+    fn test_frame(pts: u64) -> DmabufFrame {
+        DmabufFrame {
+            planes: Vec::new(),
+            width: 1,
+            height: 1,
+            drm_fourcc: 0,
+            modifier: 0,
+            pts,
+            buffer_key: 1,
+            epoch: 0,
+        }
+    }
+
+    /// Kanal leer, Sender lebt = normaler Tick ohne neuen Frame (Ok(None));
+    /// mehrere gequeue'te Frames = nur der neueste kommt zurück.
+    #[test]
+    fn drain_newest_returns_latest_frame() {
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(8);
+        assert!(drain_newest(&frame_rx).unwrap().is_none());
+        frame_tx.send(test_frame(1)).unwrap();
+        frame_tx.send(test_frame(2)).unwrap();
+        assert_eq!(drain_newest(&frame_rx).unwrap().unwrap().pts, 2);
+    }
+
+    /// Capture-Quelle weg (Fenster geschlossen → Capture-Thread endet →
+    /// Sender gedroppt): muss ein Fehler sein, KEIN „kein neuer Frame" —
+    /// sonst dupliziert der Pacing-Loop das letzte Bild für immer.
+    #[test]
+    fn drain_newest_errors_when_source_is_gone() {
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(8);
+        drop(frame_tx);
+        assert!(drain_newest(&frame_rx).is_err(), "Disconnected muss den Stream beenden");
+    }
+
+    /// Noch gequeue'te Frames werden auch bei toter Quelle erst ausgeliefert
+    /// (sie sind real und aktueller als das letzte encodierte Bild).
+    #[test]
+    fn drain_newest_delivers_queued_frames_before_reporting_gone() {
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DmabufFrame>(8);
+        frame_tx.send(test_frame(7)).unwrap();
+        drop(frame_tx);
+        assert_eq!(drain_newest(&frame_rx).unwrap().unwrap().pts, 7);
+        assert!(drain_newest(&frame_rx).is_err());
     }
 }
 
