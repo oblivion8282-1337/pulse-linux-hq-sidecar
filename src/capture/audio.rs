@@ -302,9 +302,11 @@ fn run_audio(
                     tracing::error!(target: "audio", "liefere Samples mit falscher Rate — s. Negotiat-Warnung");
                 }
                 // Capture-Zeit-Anker: JETZT gestempelt (im PW-Callback), nicht
-                // beim Empfang — s. AudioBatch-Doku.
-                let anchor = (ud.record_start.elapsed().as_secs_f64()
+                // beim Empfang — s. AudioBatch-Doku. Auf den Batch-ANFANG
+                // zurückgerechnet (s. batch_anchor).
+                let elapsed = (ud.record_start.elapsed().as_secs_f64()
                     * SAMPLE_RATE as f64) as i64;
+                let anchor = batch_anchor(elapsed, samples.len(), CHANNELS);
                 // Fehlt der Consumer, ist der Stream vorbei — Fehler ignorieren.
                 let _ = ud.sample_tx.send((samples, anchor));
             }
@@ -345,6 +347,31 @@ fn run_audio(
 /// dekodieren. `offset`/`size` kommen aus `chunk()` — der Server darf Buffers
 /// mit `offset != 0` liefern (SHM-Ringpuffer), der Ausschnitt beginnt dann
 /// NICHT bei Byte 0. Out-of-Range-Werte werden defensiv geclampt.
+/// Capture-Zeit-Anker für einen Batch: Samples seit `record_start` am
+/// Batch-ANFANG. Der Callback stempelt naturgemäß am Batch-Ende — ohne die
+/// Rückrechnung um die Batch-Länge läge der Anker bei großen
+/// PipeWire-Quanten (≥ 100 ms = Re-Anker-Schwelle) dauerhaft eine
+/// Batch-Länge vor der pts-Zeitlinie und JEDER Batch würde re-verankert
+/// (Ton dauerhaft versetzt + Log-Spam).
+fn batch_anchor(elapsed_samples: i64, interleaved_len: usize, channels: u32) -> i64 {
+    let batch_len = (interleaved_len as i64) / i64::from(channels.max(1));
+    (elapsed_samples - batch_len).max(0)
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::batch_anchor;
+
+    #[test]
+    fn anchor_points_at_batch_start() {
+        // 960 Stereo-Sample-Paare = 1920 interleaved bei 48k: Ende bei 48000
+        // → Anfang bei 47040.
+        assert_eq!(batch_anchor(48_000, 1920, 2), 47_040);
+        // Nie negativ (allererster Batch direkt nach record_start).
+        assert_eq!(batch_anchor(100, 1920, 2), 0);
+    }
+}
+
 fn samples_from_chunk(bytes: &[u8], offset: usize, size: usize) -> Vec<f32> {
     let start = offset.min(bytes.len());
     let end = start.saturating_add(size).min(bytes.len());

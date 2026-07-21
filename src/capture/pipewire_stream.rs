@@ -147,9 +147,16 @@ impl FrameMailbox {
         })
     }
 
+    /// Lock poison-fest nehmen: `put` läuft in einem C→Rust-Callback — ein
+    /// `unwrap`-Panic dort wäre ein Unwind über die extern-"C"-Grenze =
+    /// sofortiger Prozess-Abort ohne error/stopped-Event.
+    fn lock(&self) -> std::sync::MutexGuard<'_, MailboxState> {
+        self.slot.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Neuesten Frame einlegen; ein noch liegender älterer droppt (fds zu).
     pub fn put(&self, f: DmabufFrame) {
-        let mut st = self.slot.lock().unwrap();
+        let mut st = self.lock();
         let _ = st.frame.replace(f);
         drop(st);
         self.cond.notify_one();
@@ -159,7 +166,7 @@ impl FrameMailbox {
     /// `Err` = Capture-Quelle weg (geschlossen und leer) — der Stream muss
     /// enden, statt das letzte Bild ewig zu duplizieren.
     pub fn take(&self) -> anyhow::Result<Option<DmabufFrame>> {
-        let mut st = self.slot.lock().unwrap();
+        let mut st = self.lock();
         match st.frame.take() {
             Some(f) => Ok(Some(f)),
             None if st.closed => Err(anyhow::anyhow!(
@@ -174,7 +181,7 @@ impl FrameMailbox {
     /// Stop-Signal).
     pub fn wait_take(&self, slice: Duration) -> anyhow::Result<Option<DmabufFrame>> {
         let deadline = Instant::now() + slice;
-        let mut st = self.slot.lock().unwrap();
+        let mut st = self.lock();
         loop {
             if let Some(f) = st.frame.take() {
                 return Ok(Some(f));
@@ -186,14 +193,16 @@ impl FrameMailbox {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            let (guard, _timeout) = self.cond.wait_timeout(st, remaining).unwrap();
-            st = guard;
+            st = match self.cond.wait_timeout(st, remaining) {
+                Ok((g, _)) => g,
+                Err(p) => p.into_inner().0,
+            };
         }
     }
 
     /// Capture-Ende signalisieren (Producer weg).
     pub fn close(&self) {
-        self.slot.lock().unwrap().closed = true;
+        self.lock().closed = true;
         self.cond.notify_all();
     }
 }
@@ -486,8 +495,8 @@ fn run_pipewire(
                 tracing::debug!(target: "pipewire", "PW-State: {old:?} -> {new:?}");
                 // Quelle weg (gestreamtes Fenster geschlossen, Compositor trennt):
                 // Streaming/Paused → Unconnected oder Error. Mainloop beenden →
-                // Capture-Thread endet → frame_tx droppt → der Pacing-Loop sieht
-                // Disconnected und beendet den Stream sauber, statt das letzte
+                // Capture-Thread endet → FrameSender-Drop schließt die Mailbox
+                // → der Pacing-Loop beendet den Stream sauber, statt das letzte
                 // Bild ewig zu duplizieren (Zuschauer-Standbild bei weiter
                 // „Live"). `Paused` selbst ist KEIN Ende (transient bei
                 // Neuverhandlung/Minimieren); der initiale Unconnected-Zustand
@@ -583,17 +592,20 @@ fn run_pipewire(
                 }
             };
 
-            // Fixiertes Format: echte Größe/Format/Modifier übernehmen.
+            // Fixiertes/SHM-Format ist da → Guard SOFORT zurücksetzen (auch
+            // wenn der Parse gleich scheitert): sonst bliebe ein alter
+            // Announce-Key stehen und ein späterer Unfixated-Durchlauf mit
+            // gleichem Key akzeptierte einen Default, den der Server nie
+            // fixiert sah.
+            ud.announced = None;
             let mut info = VideoInfoRaw::new();
             if info.parse(param).is_err() {
                 tracing::warn!(target: "pipewire", "Format-Parse fehlgeschlagen");
                 return;
             }
-            // Erst NACH erfolgreichem Parse: Guard zurücksetzen (die nächste
-            // echte Neuverhandlung tanzt wieder) und Importer-Cache-Epoche
-            // wechseln (Neuverhandlung = neue Buffer). Ein Bump vor dem Parse
-            // ließe bei Parse-Fehlern alte Maße mit neuer Epoche laufen.
-            ud.announced = None;
+            // Epoche erst NACH erfolgreichem Parse (Neuverhandlung = neue
+            // Buffer) — ein Bump davor ließe bei Parse-Fehlern alte Maße mit
+            // neuer Epoche laufen.
             ud.epoch += 1;
             ud.width = info.size().width;
             ud.height = info.size().height;

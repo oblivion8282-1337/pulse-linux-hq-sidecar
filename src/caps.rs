@@ -13,6 +13,7 @@
 //! HEVC wird auf Linux nicht angeboten (Nutzerentscheidung: nur H264 + AV1).
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::encode;
 use crate::system::drm;
@@ -27,20 +28,38 @@ const CANDIDATES: &[&str] = &["h264", "av1"];
 /// Aufruf neu probiert — der Sidecar bleibt warm, ein dauerhaft gecachtes
 /// Fehl-Ergebnis würde HQ-Streaming sonst bis zum Prozess-Neustart abschalten.
 pub fn available_video_codecs() -> Vec<&'static str> {
-    static CACHE: Mutex<Option<Vec<&'static str>>> = Mutex::new(None);
+    /// Frühestens alle 30 s neu proben, wenn das letzte Ergebnis nicht
+    /// definitiv war: `list_profiles` fragt pro Profil, `start` bis zu 2× —
+    /// bei DAUERHAFT kaputtem Treiber wären das sonst echte Encoder-Opens
+    /// (HwContext, GPU-Kontexte) bei jedem UI-Poll, sogar während ein Stream
+    /// läuft.
+    const RETRY_EVERY: Duration = Duration::from_secs(30);
+    struct Cache {
+        definitive: Option<Vec<&'static str>>,
+        last: Option<(Instant, Vec<&'static str>)>,
+    }
+    static CACHE: Mutex<Cache> = Mutex::new(Cache { definitive: None, last: None });
+
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(v) = cache.as_ref() {
+    if let Some(v) = cache.definitive.as_ref() {
         return v.clone();
+    }
+    if let Some((at, v)) = cache.last.as_ref() {
+        if at.elapsed() < RETRY_EVERY {
+            return v.clone();
+        }
     }
     let (codecs, definitive) = probe_all();
     if definitive {
-        *cache = Some(codecs.clone());
+        cache.definitive = Some(codecs.clone());
     } else {
         tracing::warn!(
             target: "stream",
-            "Codec-Probe unvollständig — Ergebnis wird nicht gecacht (transient?)"
+            "Codec-Probe unvollständig — Retry frühestens in {}s",
+            RETRY_EVERY.as_secs()
         );
     }
+    cache.last = Some((Instant::now(), codecs.clone()));
     codecs
 }
 

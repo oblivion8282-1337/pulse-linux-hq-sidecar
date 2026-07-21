@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::OnceLock;
 
 /// `DRM_FORMAT_MOD_INVALID` — "impliziter Modifier" (Treiber-intern).
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
@@ -99,11 +100,24 @@ fn vcn_incompatible_dcc(modifier: u64) -> bool {
         && modifier & 0xFF < AMD_FMT_MOD_TILE_VER_GFX12
 }
 
+/// libEGL prozessweit laden und NIE dlclosen: initialisierte EGL-Device-
+/// Displays bleiben absichtlich stehen (s. u.) — ein Library-Drop (dlclose)
+/// zöge Treiber-State und interne Treiber-Threads den Code unter den Füßen
+/// weg, sobald kein NVENC-Importer die Lib zufällig mithält (AMD/Intel!).
+pub(crate) fn egl_library() -> Result<&'static libloading::Library, String> {
+    static LIB: OnceLock<Option<libloading::Library>> = OnceLock::new();
+    LIB.get_or_init(|| unsafe {
+        libloading::Library::new("libEGL.so.1")
+            .or_else(|_| libloading::Library::new("libEGL.so"))
+            .ok()
+    })
+    .as_ref()
+    .ok_or_else(|| "libEGL laden fehlgeschlagen".to_string())
+}
+
 fn query_into(fourccs: &[u32], out: &mut HashMap<u32, Vec<u64>>) -> Result<(), String> {
     unsafe {
-        let lib = libloading::Library::new("libEGL.so.1")
-            .or_else(|_| libloading::Library::new("libEGL.so"))
-            .map_err(|e| format!("libEGL laden: {e}"))?;
+        let lib = egl_library()?;
 
         let get_proc: libloading::Symbol<FnGetProcAddress> = lib
             .get(b"eglGetProcAddress\0")

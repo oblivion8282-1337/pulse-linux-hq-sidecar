@@ -184,8 +184,6 @@ struct CachedImage {
 /// erzeugenden Thread) und den retained CUDA-Primary-Context.
 pub struct NvDmabufImporter {
     // Libraries müssen so lange leben wie die Funktions-Pointer.
-    _egl_lib: libloading::Library,
-    _cuda_lib: libloading::Library,
 
     dpy: EglDisplay,
     ctx: EglContext,
@@ -246,6 +244,18 @@ macro_rules! egl_proc {
     }};
 }
 
+/// libcuda prozessweit laden, nie dlclosen (Treiber-Threads/Primary-Context).
+fn cuda_library() -> Result<&'static libloading::Library> {
+    static LIB: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| unsafe {
+        libloading::Library::new("libcuda.so.1")
+            .or_else(|_| libloading::Library::new("libcuda.so"))
+            .ok()
+    })
+    .as_ref()
+    .ok_or_else(|| anyhow!("libcuda laden fehlgeschlagen — NVIDIA-Treiber installiert?"))
+}
+
 macro_rules! cu_sym {
     ($lib:expr, $name:literal, $ty:ty) => {{
         let s: libloading::Symbol<$ty> = $lib
@@ -264,12 +274,11 @@ impl NvDmabufImporter {
     /// Größe davon ab, skaliert der Import per Framebuffer-Blit auf der GPU.
     pub fn new(out_w: u32, out_h: u32) -> Result<Self> {
         unsafe {
-            let egl_lib = libloading::Library::new("libEGL.so.1")
-                .or_else(|_| libloading::Library::new("libEGL.so"))
-                .map_err(|e| anyhow!("libEGL laden: {e}"))?;
-            let cuda_lib = libloading::Library::new("libcuda.so.1")
-                .or_else(|_| libloading::Library::new("libcuda.so"))
-                .map_err(|e| anyhow!("libcuda laden: {e} — NVIDIA-Treiber installiert?"))?;
+            // Beide Libs prozessweit und OHNE dlclose (s. egl_library-Doku —
+            // gilt für libcuda mit seinem Primary-Context-State genauso).
+            let egl_lib = crate::capture::egl_modifiers::egl_library()
+                .map_err(|e| anyhow!("{e}"))?;
+            let cuda_lib = cuda_library()?;
 
             let get_proc: libloading::Symbol<FnGetProcAddress> = egl_lib
                 .get(b"eglGetProcAddress\0")
@@ -450,8 +459,6 @@ impl NvDmabufImporter {
             // Ab hier übernimmt `Self::drop` das EGL-Teardown.
             egl_cleanup.armed = false;
             let mut me = Self {
-                _egl_lib: egl_lib,
-                _cuda_lib: cuda_lib,
                 dpy,
                 ctx,
                 egl_destroy_context,

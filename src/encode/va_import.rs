@@ -23,7 +23,6 @@ use std::ptr;
 use anyhow::{Result, anyhow};
 use ffmpeg_next::ffi::*;
 
-use crate::capture::egl_modifiers::DRM_FORMAT_MOD_INVALID;
 use crate::capture::pipewire_stream::DmabufFrame;
 
 /// `AV_BUFFERSRC_FLAG_PUSH` — Frame sofort durch den Graph schieben.
@@ -240,7 +239,7 @@ impl VaapiImporter {
     /// Graph + DRM-Frames-Ctx für neue Eingabemaße neu bauen (Ausgabe fix).
     /// Der Encoder hält seine EIGENE Ref auf den alten out_frames-Ctx — der
     /// alte Graph darf weg.
-    unsafe fn rebuild_for(&mut self, w: u32, h: u32) -> Result<()> {
+    unsafe fn rebuild_for(&mut self, w: u32, h: u32, fourcc: u32) -> Result<()> {
         unsafe {
             if !self.graph.is_null() {
                 avfilter_graph_free(&mut self.graph);
@@ -253,6 +252,10 @@ impl VaapiImporter {
             }
             self.width = w;
             self.height = h;
+            self.drm_fourcc = fourcc;
+            // Scheitert build_graph, bleiben die Pointer null — import()
+            // erkennt das über `graph.is_null()` und versucht es beim
+            // nächsten Frame erneut (kein halb-konfigurierter Zustand).
             self.build_graph(self.fps, self.out_w, self.out_h)
         }
     }
@@ -272,14 +275,22 @@ impl VaapiImporter {
         // scale_vaapi skaliert die neue Geometrie hinein. hwmap derived die
         // VAAPI-Device aus DEMSELBEN drm_dev → gecachte Ableitung, gleiche
         // VADisplay, die Surfaces bleiben encoder-kompatibel.
-        if frame.width != self.width || frame.height != self.height {
+        // `graph.is_null()`: ein VORHERIGER Rebuild ist mittendrin gescheitert
+        // (Pointer genullt) — ohne diese Bedingung liefe der nächste Frame mit
+        // gleichen Maßen an den genullten src_ctx (Null-Deref). So wird pro
+        // Frame erneut versucht, bis der Treiber mitspielt.
+        if frame.width != self.width
+            || frame.height != self.height
+            || frame.drm_fourcc != self.drm_fourcc
+            || self.graph.is_null()
+        {
             tracing::info!(
                 target: "stream",
-                from = format!("{}x{}", self.width, self.height),
-                to = format!("{}x{}", frame.width, frame.height),
-                "Capture-Auflösung geändert — VAAPI-Graph wird neu gebaut"
+                from = format!("{}x{} fourcc={:#x}", self.width, self.height, self.drm_fourcc),
+                to = format!("{}x{} fourcc={:#x}", frame.width, frame.height, frame.drm_fourcc),
+                "Capture-Geometrie/-Format geändert — VAAPI-Graph wird neu gebaut"
             );
-            unsafe { self.rebuild_for(frame.width, frame.height)? };
+            unsafe { self.rebuild_for(frame.width, frame.height, frame.drm_fourcc)? };
         }
         unsafe {
             // DRM-Deskriptor: ein Objekt pro Plane-fd (PipeWire dup't pro Plane),
@@ -291,11 +302,7 @@ impl VaapiImporter {
                 // size: konservativ offset + height*pitch (0 lehnen manche Treiber ab).
                 desc.objects[i].size =
                     (p.offset as isize + self.height as isize * p.stride as isize).max(0) as usize;
-                desc.objects[i].format_modifier = if frame.modifier == DRM_FORMAT_MOD_INVALID {
-                    DRM_FORMAT_MOD_INVALID
-                } else {
-                    frame.modifier
-                };
+                desc.objects[i].format_modifier = frame.modifier;
             }
             desc.nb_layers = 1;
             desc.layers[0].format = self.drm_fourcc;

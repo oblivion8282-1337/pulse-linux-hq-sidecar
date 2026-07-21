@@ -276,6 +276,34 @@ fn emit(event: Event) {
     }
 }
 
+/// Besitzt ein `AVFrame` — Drop gibt es frei. Ohne Guard leakte jeder frühe
+/// `?`-Fehlerpfad zwischen Kandidaten-Import und Teardown (häufigster Fall:
+/// `Connection refused` beim RTMPS-Open) das zuletzt importierte HW-Frame
+/// samt Ref auf den GPU-Frame-Pool — dutzende MB VRAM pro Fehlstart.
+struct OwnedFrame(*mut ffmpeg::ffi::AVFrame);
+
+impl OwnedFrame {
+    /// Ersetzt das gehaltene Frame (das alte wird freigegeben).
+    fn replace(&mut self, new: *mut ffmpeg::ffi::AVFrame) {
+        unsafe {
+            if !self.0.is_null() {
+                ffmpeg::ffi::av_frame_free(&mut self.0);
+            }
+        }
+        self.0 = new;
+    }
+
+    fn raw(&self) -> *mut ffmpeg::ffi::AVFrame {
+        self.0
+    }
+}
+
+impl Drop for OwnedFrame {
+    fn drop(&mut self) {
+        self.replace(std::ptr::null_mut());
+    }
+}
+
 /// Drop-Guard im Worker-Thread: setzt die Shared-Flags auch dann zurück, wenn
 /// der Worker PANICT (Unwind läuft am regulären Pfad vorbei). Ohne das bliebe
 /// `running = true` stehen — `reap_finished` griffe nie, `state` meldete ewig
@@ -382,6 +410,20 @@ impl StreamController {
                 shared_worker.running.store(false, Ordering::SeqCst);
                 shared_worker.live.store(false, Ordering::SeqCst);
                 match result {
+                    // Fehler, während der User ohnehin gestoppt hat (Race
+                    // Quelle-weg vs. Stop, Abbruchfehler im Teardown): der
+                    // Stop war gewollt — sauberes Ende, Fehler nur ins Log.
+                    Err(e) if shared_worker.stop_requested.load(Ordering::SeqCst) => {
+                        emit(Event::Log {
+                            line: format!("[stream] Fehler beim Stop (ignoriert): {e:#}"),
+                        });
+                        emit(Event::State {
+                            state: StreamState::Stopped,
+                            running: false,
+                            uptime_s: 0,
+                        });
+                        emit(Event::Stopped { code: None });
+                    }
                     // Parität zu control.py: nach einem Fehler bleibt der
                     // Terminalzustand `error` — KEIN `stopped` hinterher
                     // (das flippte die UI auf neutrales „Beendet" statt des
@@ -639,12 +681,21 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     // schließen sich selbst (Drop) und geben den GPU-Puffer frei (wichtig
     // genau dann, wenn die GPU eh schon in Speichernot ist und der User
     // mehrfach neu startet).
-    let Some((vendor, node, mut importer, mut last_hw)) = chosen else {
+    let Some((vendor, node, mut importer, last_hw_raw)) = chosen else {
         return Err(
             last_err.unwrap_or_else(|| anyhow!("kein GPU-Importer für den aufgenommenen Buffer"))
         );
     };
+    // Ab hier besitzt der Guard das Frame — jeder Fehlerpfad bis zum
+    // Teardown gibt es automatisch frei.
+    let mut last_hw = OwnedFrame(last_hw_raw);
     drop(first);
+    // Stop-abbrechbar auch HIER: zwischen First-Frame und Live-Loop liegen
+    // Netz-Operationen mit bis zu ~10-30 s Timeouts (TCP+TLS+RTMP-Handshake)
+    // — stop()/stdin-EOF joint den Worker und fröre solange die RPC-Schleife.
+    if shared.stop_requested.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
     emit(Event::Log {
         line: format!(
             "[stream] Encode-Pfad: {} auf {}",
@@ -676,8 +727,14 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
         sample_rate: audio::SAMPLE_RATE,
         bitrate_kbps: AUDIO_BITRATE_KBPS,
     });
+    if shared.stop_requested.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
     let (mut enc, audio_enc) =
         VideoEncoder::create_with_audio(&cfg, hw_pixel, frames_ctx, &params.push_url, audio_params)?;
+    if shared.stop_requested.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
 
     // 7) GEMEINSAMER Zeit-Nullpunkt für Video UND Audio (GSR-Modell): beide
     //    Spuren leiten ihre pts aus DERSELBEN Monotonic-Uhr ab → kein Drift,
@@ -737,13 +794,21 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             }
 
             // Neuesten Frame abholen; Err = Capture-Quelle weg (Fenster
-            // geschlossen) → Stream sauber beenden statt das letzte Bild ewig
-            // zu duplizieren (error-Event → Live-Badge verschwindet).
-            if let Some(frame) = frames.take()? {
+            // geschlossen) → SAUBERES Ende (state:stopped + stopped), kein
+            // roter Fehler: das schlichte Schließen der gestreamten App ist
+            // kein Fehlverhalten. (Der frühere `?` routete das in den
+            // error-Terminalzustand — Widerspruch zum Fenster-zu-Fix.)
+            let taken = match frames.take() {
+                Ok(t) => t,
+                Err(e) => {
+                    emit(Event::Log { line: format!("[stream] {e:#} — Stream endet") });
+                    break;
+                }
+            };
+            if let Some(frame) = taken {
                 match importer.import(&frame) {
                     Ok(hw) => {
-                        unsafe { ffmpeg::ffi::av_frame_free(&mut last_hw) };
-                        last_hw = hw;
+                        last_hw.replace(hw);
                     }
                     Err(e) => emit(Event::Log {
                         line: format!("[stream] Frame-Import übersprungen: {e:#}"),
@@ -763,7 +828,7 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
             next_pts = pts + 1;
 
             // Aktuelles (ggf. dupliziertes) Bild encodieren.
-            enc.send_hw(last_hw, pts)?;
+            enc.send_hw(last_hw.raw(), pts)?;
             window_frames += 1;
 
             if window_start.elapsed() >= Duration::from_secs(1) {
@@ -795,13 +860,21 @@ fn run_stream(params: StartParams, stop_rx: Receiver<()>, shared: &Shared) -> Re
     if let Some(mut ap) = audio_pipeline.take() {
         ap.stop();
     }
-    unsafe {
-        if !last_hw.is_null() {
-            ffmpeg::ffi::av_frame_free(&mut last_hw);
-        }
-    }
+    drop(last_hw); // GPU-Frame vor dem Encoder-Finish freigeben
     let finish_result = enc.finish();
-    run_result.and(finish_result).map(|_| None)
+    match (run_result, finish_result) {
+        (Ok(()), Ok(())) => Ok(None),
+        // Sauberes Ende, aber der Abschluss (Trailer auf totem Socket …)
+        // scheiterte: der User wollte stoppen — das ist ein Log, kein roter
+        // Terminalfehler.
+        (Ok(()), Err(e)) => {
+            emit(Event::Log {
+                line: format!("[stream] Abschluss-Fehler beim Beenden (ignoriert): {e:#}"),
+            });
+            Ok(None)
+        }
+        (Err(e), _) => Err(e),
+    }
 }
 
 /// Import-Kandidaten in Hersteller-Reihenfolge zu konkreten Render-Nodes
