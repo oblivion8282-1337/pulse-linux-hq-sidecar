@@ -89,15 +89,25 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // EOF on stdin → let the writer thread finish. Drop the emitter-internal
-    // sender clone first, otherwise the OnceLock holds it for the whole process
-    // lifetime and `writer.join()` hangs forever.
+    // EOF on stdin → Stream ZUERST stoppen: solange der Writer lebt, erreichen
+    // die Terminal-Events (state:stopped/stopped) noch die Leitung — vorher
+    // verpufften sie zwischen shutdown() und stop().
+    let _ = pulse_linux_hq_sidecar::stream_controller::StreamController::singleton().stop();
+
+    // Dann den Writer beenden. Drop the emitter-internal sender clone first,
+    // otherwise the OnceLock holds it for the whole process lifetime and the
+    // join hangs forever.
     events::shutdown();
     drop(out_tx);
-    let _ = writer.join();
-
-    // Stop any running stream on shutdown (StreamController kommt in Phase 5).
-    let _ = pulse_linux_hq_sidecar::stream_controller::StreamController::singleton().stop();
+    // Bounded join: hält der Parent das stdout-Read-Ende offen, liest aber
+    // nicht mehr (eingefrorenes Electron), bliebe writeln!/flush auf der
+    // vollen Pipe ewig stehen — und mit ihm der ganze Shutdown.
+    let (join_tx, join_rx) = std::sync::mpsc::channel::<()>();
+    thread::spawn(move || {
+        let _ = writer.join();
+        let _ = join_tx.send(());
+    });
+    let _ = join_rx.recv_timeout(std::time::Duration::from_secs(3));
 
     Ok(())
 }

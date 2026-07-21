@@ -163,7 +163,7 @@ pub fn handle(params: Map<String, Value>) -> Result<Map<String, Value>> {
 /// 2^32 → 0 kbps) — ein kaputt konfigurierter/veralteter Client bekäme einen
 /// unbrauchbaren Stream statt eines klaren Werts. 1 Gbit/s deckt jedes reale
 /// Profil (Profile liegen bei 4000).
-fn effective_bitrate(requested: Option<u64>, profile_default: u32) -> u32 {
+pub(crate) fn effective_bitrate(requested: Option<u64>, profile_default: u32) -> u32 {
     requested
         .filter(|&v| v > 0)
         .unwrap_or(profile_default as u64)

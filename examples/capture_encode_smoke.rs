@@ -103,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         if sent >= n_frames {
             break;
         }
-        frame = match rx.wait_take(Duration::from_secs(5)).and_then(|o| o.ok_or_else(|| anyhow::anyhow!("Timeout"))) {
+        frame = match rx.wait_take(Duration::from_secs(5)).and_then(|o| o.ok_or_else(|| anyhow::anyhow!("Timeout (kein Damage?) oder Quelle beendet"))) {
             Ok(f) => f,
             Err(_) => {
                 eprintln!("[capture_encode] 5s ohne Frame (kein Damage?) — beende mit {sent} Frames");

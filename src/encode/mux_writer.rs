@@ -17,8 +17,9 @@ use ffmpeg::{Packet, format};
 const QUEUE_CAPACITY: usize = 256;
 
 /// `ffmpeg::Packet` isn't `Send` (ffmpeg-next marks it conservatively). The
-/// hand-off is sound: the packet is created on the pacing thread, *moved* over
-/// the channel to exactly one writer thread and consumed there — no aliasing.
+/// hand-off is sound: the packet is created on ONE producer thread (video
+/// pacing loop or audio encode thread), *moved* over the channel to exactly
+/// one writer thread and consumed there — no aliasing.
 struct SendPacket(Packet);
 // SAFETY: see above.
 unsafe impl Send for SendPacket {}
